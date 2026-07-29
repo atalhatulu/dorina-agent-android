@@ -114,6 +114,57 @@ object ToolRegistry {
                     }
                 }
 
+                "open_camera" -> {
+                    val intent = Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (intent.resolveActivity(context.packageManager) != null) {
+                        context.startActivity(intent)
+                        ToolResult(toolName, true, "Kamera başarıyla açıldı.")
+                    } else {
+                        ToolResult(toolName, false, "Kamera uygulaması bulunamadı.")
+                    }
+                }
+
+                "toggle_flash" -> {
+                    val state = args["state"] ?: "on"
+                    val turnOn = state.lowercase() == "on"
+                    try {
+                        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                        val cameraId = cameraManager.cameraIdList[0]
+                        cameraManager.setTorchMode(cameraId, turnOn)
+                        ToolResult(toolName, true, if (turnOn) "Flaş başarıyla açıldı." else "Flaş başarıyla kapatıldı.")
+                    } catch (e: Exception) {
+                        ToolResult(toolName, false, "Flaş kontrol edilemedi: ${e.message}")
+                    }
+                }
+
+                "open_app" -> {
+                    val appName = args["app_name"] ?: ""
+                    if (appName.isBlank()) {
+                        return@withContext ToolResult(toolName, false, "Lütfen açmak istediğiniz uygulamanın adını belirtin.")
+                    }
+                    val pm = context.packageManager
+                    val packages = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
+                    var found = false
+                    for (app in packages) {
+                        val name = pm.getApplicationLabel(app).toString()
+                        if (name.contains(appName, ignoreCase = true)) {
+                            val launchIntent = pm.getLaunchIntentForPackage(app.packageName)
+                            if (launchIntent != null) {
+                                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                context.startActivity(launchIntent)
+                                found = true
+                                return@withContext ToolResult(toolName, true, "$name başarıyla açıldı.")
+                            }
+                        }
+                    }
+                    if (!found) {
+                        ToolResult(toolName, false, "$appName isimli uygulama bulunamadı.")
+                    } else {
+                        ToolResult(toolName, false, "Bilinmeyen bir hata oluştu.")
+                    }
+                }
+
                 else -> ToolResult(toolName, false, "Bilinmeyen araç: $toolName")
             }
         } catch (e: Exception) {

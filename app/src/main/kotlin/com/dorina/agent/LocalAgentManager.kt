@@ -33,6 +33,10 @@ class LocalAgentManager(private val context: Context) {
         6. write_note - Save a note to persistent local memory. Args: {"text": "Remember to check battery level"}
         7. read_notes - Read all saved memory notes. Args: {}
 
+        8. open_camera - Launch the device camera. Args: {}
+        9. toggle_flash - Turn the flashlight on or off. Args: {"state": "on" veya "off"}
+        10. open_app - Open an installed app by its name (e.g. WhatsApp, YouTube). Args: {"app_name": "WhatsApp"}
+
         RESPONSE FORMAT RULES:
         If you need to use a tool, respond ONLY with a raw JSON object like this:
         {
@@ -255,6 +259,20 @@ class LocalAgentManager(private val context: Context) {
             }
             lower.contains("tarih") || lower.contains("saat") -> {
                 """{"tool": "run_safe_command", "args": {"command": "date"}}"""
+            }
+            lower.contains("kamera") || lower.contains("fotoğraf") -> {
+                """{"tool": "open_camera", "args": {}}"""
+            }
+            lower.contains("flaş") || lower.contains("fener") || lower.contains("ışık") || lower.contains("flash") -> {
+                val state = if (lower.contains("kapat")) "off" else "on"
+                """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
+            }
+            lower.contains("aç") && !lower.contains("flaş") && !lower.contains("fener") && !lower.contains("kamera") -> {
+                // Basit kural tabanlı uygulama açma mantığı (Uygulama ismini tahmin eder)
+                val words = lower.split(" ")
+                val appNameIndex = words.indexOf("aç") - 1
+                val appName = if (appNameIndex >= 0) words[appNameIndex] else "Bilinmeyen"
+                """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
             }
             else -> "Merhaba! Ben Dorina. S24 Ultra cihazınızda yerel AI Ajanınız hizmetinizde. Nasıl yardımcı olabilirim?"
         }
