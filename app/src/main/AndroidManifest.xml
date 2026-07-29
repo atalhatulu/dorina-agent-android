@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <application
+        android:usesCleartextTraffic="true"
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
         android:label="Dorina Agent"
