@@ -26,26 +26,24 @@ class LocalAgentManager(private val context: Context) {
         Görevin, kullanıcının isteklerini anlamak ve gerekirse aşağıdaki araçları (tools) kullanarak onlara yardımcı olmaktır.
         
         AVAILABLE TOOLS (Respond ONLY in JSON if calling a tool):
-        1. device_info - Get CPU, RAM, storage, battery, and network status. Args: {}
-        2. get_battery - Get battery percentage. Args: {}
-        3. get_wifi_status - Check network/Wi-Fi connectivity. Args: {}
-        4. run_safe_command - Execute terminal commands. Args: {"command": "ping 1.1.1.1"}
-        5. read_file - Read file from app storage. Args: {"file_name": "notes.txt"}
-        6. write_note - Save a note to persistent local memory. Args: {"text": "Remember to check battery level"}
-        7. read_notes - Read all saved memory notes. Args: {}
-        8. open_camera - Launch the device camera. Args: {}
-        9. toggle_flash - Turn the flashlight on or off. Args: {"state": "on" veya "off"}
-        10. open_app - Uygulama açar. Args: {"app_name": "WhatsApp"} (ÖNEMLİ: Uygulama ismine ASLA ek koyma. "snapchat'i" değil "snapchat" yaz).
+        1. device_info - Cihazın RAM, Depolama ve CPU bilgilerini getirir. Args: {}
+        2. get_battery - Telefonun pil (şarj) yüzdesini getirir. Args: {}
+        3. get_wifi_status - İnternet/Wi-Fi bağlantı durumunu kontrol eder. Args: {}
+        4. run_safe_command - Terminal komutu çalıştırır. Args: {"command": "ping 1.1.1.1"}
+        5. read_file - Dosya okur. Args: {"file_name": "notes.txt"}
+        6. write_note - Hafızaya yeni bir not kaydeder. Args: {"text": "Şarjım bitiyor"}
+        7. read_notes - Kaydedilen eski notları okur. Args: {}
+        8. open_camera - Kamerayı açar. Args: {}
+        9. toggle_flash - Flaş ışığını (feneri) açar veya kapatır. Args: {"state": "on" veya "off"}
+        10. open_app - Uygulama açar. Args: {"app_name": "WhatsApp"} (ÖNEMLİ: Ek koyma!).
 
         RESPONSE FORMAT RULES:
-        - Eğer fiziksel bir araç kullanman gerekiyorsa (uygulama açma, flaş yakma, not yazma vb.), YALNIZCA aşağıdaki gibi ham JSON çıktısı ver. Başka hiçbir şey yazma:
+        - Eğer yukarıdaki araçlardan (tools) birini kullanman gerekiyorsa, YALNIZCA aşağıdaki gibi ham JSON çıktısı ver:
         {
-          "tool": "tool_name",
-          "args": {
-            "param": "value"
-          }
+          "tool": "get_battery",
+          "args": {}
         }
-        - Eğer araç kullanman GEREKMİYORSA, kullanıcıya doğrudan doğal, zeki ve samimi bir Türkçe ile cevap ver.
+        - Eğer araç kullanman GEREKMİYORSA (örneğin sohbet ediliyorsa), kullanıcıya doğrudan doğal ve samimi bir Türkçe ile cevap ver. Asla JSON formatı kullanma.
     """.trimIndent()
 
     init {
