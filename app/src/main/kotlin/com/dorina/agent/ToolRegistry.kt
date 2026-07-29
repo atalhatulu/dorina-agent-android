@@ -143,12 +143,16 @@ object ToolRegistry {
                     if (appName.isBlank()) {
                         return@withContext ToolResult(toolName, false, "Lütfen açmak istediğiniz uygulamanın adını belirtin.")
                     }
+                    
+                    // Ekleri temizle (Örn: "snapchati", "whatsapp'ı", "instagrama")
+                    val cleanAppName = appName.replace(Regex("['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü|nin|nın)$", RegexOption.IGNORE_CASE), "").trim()
+
                     val pm = context.packageManager
                     val packages = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
                     var found = false
                     for (app in packages) {
                         val name = pm.getApplicationLabel(app).toString()
-                        if (name.contains(appName, ignoreCase = true)) {
+                        if (name.contains(cleanAppName, ignoreCase = true)) {
                             val launchIntent = pm.getLaunchIntentForPackage(app.packageName)
                             if (launchIntent != null) {
                                 launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -159,7 +163,7 @@ object ToolRegistry {
                         }
                     }
                     if (!found) {
-                        ToolResult(toolName, false, "$appName isimli uygulama bulunamadı.")
+                        ToolResult(toolName, false, "$cleanAppName isimli uygulama bulunamadı. (Aranan: $cleanAppName)")
                     } else {
                         ToolResult(toolName, false, "Bilinmeyen bir hata oluştu.")
                     }
