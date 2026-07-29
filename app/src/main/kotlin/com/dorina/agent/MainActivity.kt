@@ -30,9 +30,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (BuildConfig.DEBUG) {
-            Timber.plant(Timber.DebugTree())
-        }
+        Timber.plant(Timber.DebugTree())
 
         checkAudioPermission()
         handleAssistIntent(intent)
