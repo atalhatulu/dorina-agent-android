@@ -54,9 +54,10 @@ class LocalAgentManager(private val context: Context) {
 
     private fun autoDiscoverAndInitializeModel() {
         val searchPaths = listOf(
-            "/sdcard/Documents/dorina-agent-android/app/src/main/assets/gemma-2b-it-cpu.bin",
+            "/sdcard/Download/gemma-2b-it-gpu-int4.bin",
             "/sdcard/Download/gemma-2b-it-cpu.bin",
             "/sdcard/Download/gemma.bin",
+            "${context.getExternalFilesDir(null)}/gemma-2b-it-gpu-int4.bin",
             "${context.getExternalFilesDir(null)}/gemma-2b-it-cpu.bin"
         )
 
