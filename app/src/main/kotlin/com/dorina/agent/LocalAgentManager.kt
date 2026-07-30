@@ -19,11 +19,14 @@ class LocalAgentManager(private val context: Context) {
     var activeEngineName: String = "Detecting..."
         private set
 
-    private val OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+    private val OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+    private val OLLAMA_GEN_URL = "http://127.0.0.1:11434/api/generate"
 
-    // ── Bellek (konuşma geçmişi) ──
-    private val conversationHistory = mutableListOf<Pair<String, String>>()  // (user, assistant)
-    private val MAX_HISTORY = 6  // son 3 diyalogu hatırla
+    // ── Agent State ──
+    private val conversationHistory = mutableListOf<ChatMessage>()
+    private val MAX_HISTORY = 10  // son 5 diyalog
+
+    data class ChatMessage(val role: String, val content: String)  // role: user / assistant / tool
 
     data class ToolDef(
         val name: String,
@@ -38,7 +41,7 @@ class LocalAgentManager(private val context: Context) {
         ToolDef("terminal", "Her türlü shell/terminal komutu. ping, dosya işlemleri, curl, sistem bilgisi", "{\"command\": \"...\"}"),
         ToolDef("open_camera", "Kamerayı açar", "{}"),
         ToolDef("toggle_flash", "Feneri açar/kapatır", "{\"state\": \"on/off\"}"),
-        ToolDef("open_app", "Bir uygulamayı açar", "{\"app_name\": \"WhatsApp\"}"),
+        ToolDef("open_app", "Bir uygulamayı açar", "{\"app_name\": \"...\"}"),
         ToolDef("write_note", "Not kaydeder", "{\"text\": \"...\"}"),
         ToolDef("read_notes", "Kayıtlı notları okur", "{}"),
         ToolDef("read_file", "Dosya okur", "{\"file_name\": \"...\"}")
@@ -87,159 +90,184 @@ class LocalAgentManager(private val context: Context) {
         }
     }
 
-    // ── ANA AGENT LOOP ──
+    // ── REACT AGENT LOOP ──
 
     suspend fun processQuery(userInput: String): Flow<AgentState> = flow {
-        emit(AgentState.Thinking("Anlamaya çalışıyorum..."))
+        emit(AgentState.Thinking("Düşünüyorum..."))
 
-        // 1. Önce Kural Motoru (hızlı, LLM gerektirmez)
-        val ruleResult = simulateRuleFallback(userInput)
-        val ruleToolCall = parseJsonToolCall(ruleResult)
-        if (ruleToolCall != null) {
-            val (toolName, args) = ruleToolCall
-            emit(AgentState.ExecutingTool(toolName, args))
-            val toolResult = ToolRegistry.executeTool(context, toolName, args)
+        // Kullanıcı mesajını ekle
+        conversationHistory.add(ChatMessage("user", userInput))
 
-            val summary = summarizeWithLLM(userInput, toolName, toolResult)
-            conversationHistory.add(userInput to summary)
-            trimHistory()
+        var maxSteps = 8
+        var stepCount = 0
+        var finalAnswer: String? = null
 
-            emit(AgentState.Completed(summary, toolResult))
-            return@flow
-        }
+        while (stepCount < maxSteps && finalAnswer == null) {
+            stepCount++
+            emit(AgentState.Thinking("Adım $stepCount/$maxSteps..."))
 
-        // 2. LLM İLE KARAR VERME (sınıflandırma + tool seçimi)
-        if (isInitialized && llmInference != null || checkOllamaConnection()) {
-            val llmDecision = askLLM(userInput)
-            val toolCall = parseJsonToolCall(llmDecision)
+            // 1. THINK: LLM'den karar al
+            val llmResponse = askLLM()
+            if (llmResponse.isBlank()) {
+                // LLM yoksa kural motoruna düş
+                val ruleResult = simulateRuleFallback(userInput)
+                val toolCall = parseToolCall(ruleResult)
+                if (toolCall != null) {
+                    val (toolName, args) = toolCall
+                    emit(AgentState.ExecutingTool(toolName, args))
+                    val toolResult = ToolRegistry.executeTool(context, toolName, args)
+                    conversationHistory.add(ChatMessage("tool", "[$toolName] ${toolResult.result}"))
+                    val summary = formatSimpleResult(toolName, toolResult)
+                    conversationHistory.add(ChatMessage("assistant", summary))
+                    trimHistory()
+                    emit(AgentState.Completed(summary, toolResult))
+                    return@flow
+                }
+                // Hiçbir şey bulamadı
+                val fallbackMsg = "Ne yapacağımı bilemedim. Şunları deneyebilirsin: pil kaç, hava nasıl, WhatsApp'ı aç, ping at, not al"
+                conversationHistory.add(ChatMessage("assistant", fallbackMsg))
+                trimHistory()
+                emit(AgentState.Completed(fallbackMsg, null))
+                return@flow
+            }
+
+            // 2. PARSE: Tool çağrısı mı, yoksa direkt cevap mı?
+            val toolCall = parseToolCall(llmResponse)
 
             if (toolCall != null) {
+                // ACT: Tool'u çalıştır
                 val (toolName, args) = toolCall
                 emit(AgentState.ExecutingTool(toolName, args))
                 val toolResult = ToolRegistry.executeTool(context, toolName, args)
 
-                val summary = summarizeWithLLM(userInput, toolName, toolResult, llmDecision)
-                conversationHistory.add(userInput to summary)
+                // OBSERVE: Sonucu geçmişe ekle (LLM bir sonraki adımda görecek)
+                val observation = "[TOOL: $toolName]\n${toolResult.result}"
+                conversationHistory.add(ChatMessage("assistant", llmResponse))
+                conversationHistory.add(ChatMessage("tool", observation))
                 trimHistory()
 
-                emit(AgentState.Completed(summary, toolResult))
-                return@flow
-            }
+                if (!toolResult.success) {
+                    // Hata durumunda LLM'e bildir, düzeltmesini iste
+                    conversationHistory.add(ChatMessage("user", "Araç '$toolName' hata verdi: ${toolResult.result}. Lütfen düzelt veya alternatif bir yol dene."))
+                }
+            } else {
+                // FINAL ANSWER: LLM direkt cevap verdi, döngüyü bitir
+                val cleanAnswer = llmResponse
+                    .replace(Regex("<thinking>.*?</thinking>", RegexOption.DOT_MATCHES_ALL), "")
+                    .replace(Regex("<thought>.*?</thought>", RegexOption.DOT_MATCHES_ALL), "")
+                    .trim()
 
-            // LLM tool çağırmadı ama anlamlı cevap verdi
-            if (llmDecision.isNotBlank() && llmDecision.length > 8) {
-                conversationHistory.add(userInput to llmDecision)
+                conversationHistory.add(ChatMessage("assistant", cleanAnswer))
                 trimHistory()
-                emit(AgentState.Completed(llmDecision, null))
+                emit(AgentState.Completed(cleanAnswer, null))
                 return@flow
             }
         }
 
-        // 3. Hiçbir şey işe yaramadı
-        emit(AgentState.Completed(
-            "Şu anda ne yapacağımı bilemedim.\n" +
-            "Şunları deneyebilirsin:\n" +
-            "• \"Pil kaç\" — pil durumu\n" +
-            "• \"Hava nasıl\" — hava durumu\n" +
-            "• \"WhatsApp'ı aç\" — uygulama aç\n" +
-            "• \"ping 8.8.8.8\" — ağ testi\n" +
-            "• \"not al: toplantı 15:00\" — hatırlatıcı",
-            null
-        ))
+        // Maksimum adım aşıldı
+        val timeoutMsg = "Çok adımlı bir işlem ama tamamlayamadım. Lütfen daha basit bir şekilde iste."
+        conversationHistory.add(ChatMessage("assistant", timeoutMsg))
+        trimHistory()
+        emit(AgentState.Completed(timeoutMsg, null))
     }.flowOn(Dispatchers.IO)
 
-    // ── LLM Karar Verme ──
+    // ── LLM Sorgulama ──
 
-    private fun askLLM(userInput: String): String {
-        // Geçmişi ekle
-        val historyBlock = conversationHistory.takeLast(4).joinToString("\n") { (u, a) ->
-            "Kullanıcı: $u\nDorina: $a"
+    private fun askLLM(): String {
+        // Prompt'u oluştur
+        val toolDescriptions = availableTools.joinToString("\n") { t ->
+            "  - ${t.name}: ${t.description} (args: ${t.args})"
         }
 
-        val toolList = availableTools.joinToString("\n") {
-            "  • ${it.name} - ${it.description} (args: ${it.args})"
+        // Konuşma geçmişini formatla
+        val historyText = conversationHistory.joinToString("\n") { msg ->
+            when (msg.role) {
+                "user" -> "Kullanıcı: ${msg.content}"
+                "assistant" -> "Dorina: ${msg.content}"
+                "tool" -> "[Gözlem]\n${msg.content}"
+                else -> "${msg.content}"
+            }
         }
 
-        val prompt = """
-            $historyBlock
-            
-            Kullanıcı: $userInput
-            
-            Sen Dorina'sın. Kullanıcının isteğini anla ve en uygun aracı seç.
-            
-            ARAÇLAR:
-            $toolList
+        val systemPrompt = """
+Sen Dorina'sın — Android cihazda çalışan basit ama zeki bir AI asistan.
 
-            KURALLAR:
-            - Sadece yukarıdaki araçlardan birini seç
-            - Cevap SADECE JSON olmalı: {"tool": "...", "args": {...}}
-            - Hiçbir araç uygun değilse normal Türkçe cevap ver
-            
-            CEVAP:
-        """.trimIndent()
+KULLANILABİLİR ARAÇLAR:
+$toolDescriptions
+
+KURALLAR:
+1. Kullanıcının isteğini anla.
+2. Eğer bir araç kullanman gerekiyorsa, JSON formatında yanıt ver:
+   {"tool": "tool_adi", "args": {"param": "deger"}}
+3. Araç gerekiyorsa SADECE JSON döndür, fazla metin yazma.
+4. Araç kullanmadan cevap verebiliyorsan direkt Türkçe cevap ver.
+5. Tool çalıştıysa ve sonuç geldiyse, o sonuca göre kullanıcıya güzel bir cevap hazırla.
+6. Eğer kullanıcının isteği için birden fazla araç gerekiyorsa, sırayla her adımda birini çağır.
+
+KARAR VERME:
+- Eğer bir araç çağırman gerekiyorsa → {"tool": "...", "args": {...}}
+- Eğer cevap hazırsa veya araç gerekmiyorsa → direkt Türkçe metin
+
+KONUŞMA GEÇMİŞİ:
+$historyText
+
+Kullanıcı son mesajı: ${conversationHistory.lastOrNull { it.role == "user" }?.content ?: ""}
+
+Şimdi karar ver:
+""".trimIndent()
 
         // MediaPipe dene
         if (isInitialized && llmInference != null) {
             try {
-                return llmInference?.generateResponse(prompt) ?: ""
-            } catch (_: Exception) {}
+                val result = llmInference?.generateResponse(systemPrompt) ?: ""
+                if (result.length > 5) return result
+            } catch (e: Exception) {
+                Timber.w("MediaPipe error: ${e.message}")
+            }
         }
 
         // Ollama dene
-        return queryOllama(prompt) ?: ""
+        val ollamaResult = queryOllama(systemPrompt)
+        if (ollamaResult != null) return ollamaResult
+
+        return ""
     }
 
-    // ── LLM ile Özetleme ──
-
-    private fun summarizeWithLLM(
-        userQuery: String,
-        toolName: String,
-        result: ToolResult,
-        llmHint: String? = null
-    ): String {
-        if (result.success) {
-            // LLM varsa sonucu doğal dile çevir
-            val prompt = """
-                Kullanıcı: $userQuery
-                Araç: $toolName
-                ${if (llmHint != null) "Seçim: $llmHint" else ""}
-                Sonuç: ${result.result}
-                
-                Kullanıcıya sonucu kısa ve doğal Türkçe ile söyle. Aracın adını söyleme, direkt cevap ver.
-            """.trimIndent()
-
-            if (isInitialized && llmInference != null) {
-                try {
-                    val r = llmInference?.generateResponse(prompt) ?: ""
-                    if (r.length > 10) return r
-                } catch (_: Exception) {}
+    // ── Tool Call Parse ──
+    private fun parseToolCall(response: String): Pair<String, Map<String, String>>? {
+        try {
+            val trimmed = response.trim()
+            // JSON object ara
+            val jsonStart = trimmed.indexOf('{')
+            val jsonEnd = trimmed.lastIndexOf('}')
+            if (jsonStart != -1 && jsonEnd > jsonStart) {
+                val jsonStr = trimmed.substring(jsonStart, jsonEnd + 1)
+                val jsonObj = JSONObject(jsonStr)
+                if (jsonObj.has("tool")) {
+                    val toolName = jsonObj.getString("tool")
+                    val argsMap = mutableMapOf<String, String>()
+                    if (jsonObj.has("args")) {
+                        val argsObj = jsonObj.getJSONObject("args")
+                        argsObj.keys().forEach { key ->
+                            argsMap[key] = argsObj.optString(key, "")
+                        }
+                    }
+                    return Pair(toolName, argsMap)
+                }
             }
 
-            val ollamaR = queryOllama(prompt)
-            if (ollamaR != null && ollamaR.length > 10) return ollamaR
-
-            // LLM yoksa formatlı düz metin
-            return formatToolResult(toolName, result)
-        } else {
-            return "❌ $toolName hatası: ${result.result}"
-        }
-    }
-
-    private fun formatToolResult(toolName: String, result: ToolResult): String {
-        return when (toolName) {
-            "get_battery" -> result.result.replace("Mevcut batarya seviyesi: %", "Pil seviyen: %")
-            "get_wifi_status" -> result.result.replace("Ağ Durumu:", "Bağlantı:")
-            "device_info" -> result.result
-            "terminal" -> {
-                val lines = result.result.lines().filter { it.isNotBlank() }
-                lines.joinToString("\n")
+            // Bazen LLM sadece tool ismi yazabilir
+            val toolMatch = Regex("""\{\s*"tool"\s*:\s*"(\w+)"\s*\}""").find(trimmed)
+            if (toolMatch != null) {
+                return Pair(toolMatch.groupValues[1], emptyMap())
             }
-            else -> result.result
+        } catch (e: Exception) {
+            Timber.w("parseToolCall error: ${e.message}")
         }
+        return null
     }
 
     // ── Ollama ──
-
     private fun checkOllamaConnection(): Boolean {
         return try {
             val url = URL("http://127.0.0.1:11434/api/tags")
@@ -254,8 +282,70 @@ class LocalAgentManager(private val context: Context) {
     }
 
     private fun queryOllama(prompt: String): String? {
+        // Önce chat API dene (daha iyi context yönetimi)
+        val chatResult = queryOllamaChat(prompt)
+        if (chatResult != null) return chatResult
+        // Fallback: generate API
+        return queryOllamaGenerate(prompt)
+    }
+
+    private fun queryOllamaChat(systemPrompt: String): String? {
         return try {
-            val url = URL(OLLAMA_URL)
+            val url = URL(OLLAMA_CHAT_URL)
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.connectTimeout = 5000
+            conn.readTimeout = 30000
+            conn.doOutput = true
+            // Messages array oluştur
+            val messagesArray = org.json.JSONArray()
+            // System prompt
+            val systemMsg = JSONObject().apply {
+                put("role", "system")
+                put("content", systemPrompt)
+            }
+            messagesArray.put(systemMsg)
+            // Geçmiş konuşmalar
+            for (msg in conversationHistory) {
+                val role = when (msg.role) {
+                    "user" -> "user"
+                    "assistant" -> "assistant"
+                    "tool" -> "user" // tool output'u user message olarak ekle
+                    else -> "user"
+                }
+                val msgObj = JSONObject().apply {
+                    put("role", role)
+                    put("content", msg.content)
+                }
+                messagesArray.put(msgObj)
+            }
+            val jsonBody = JSONObject().apply {
+                put("model", "gemma:2b")
+                put("messages", messagesArray)
+                put("stream", false)
+                put("options", JSONObject().apply {
+                    put("temperature", 0.7)
+                    put("num_predict", 1024)
+                })
+            }
+            conn.outputStream.use { os ->
+                os.write(jsonBody.toString().toByteArray(Charsets.UTF_8))
+            }
+            if (conn.responseCode == 200) {
+                val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
+                val responseJson = JSONObject(responseStr)
+                responseJson.getJSONObject("message").optString("content", null)
+            } else null
+        } catch (e: Exception) {
+            Timber.w("Ollama chat: ${e.message}")
+            null
+        }
+    }
+
+    private fun queryOllamaGenerate(prompt: String): String? {
+        return try {
+            val url = URL(OLLAMA_GEN_URL)
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
@@ -281,43 +371,10 @@ class LocalAgentManager(private val context: Context) {
         }
     }
 
-    // ── JSON Ayrıştırıcı ──
-
-    private fun parseJsonToolCall(response: String): Pair<String, Map<String, String>>? {
-        return try {
-            val trimmed = response.trim()
-            val jsonStart = trimmed.indexOf('{')
-            val jsonEnd = trimmed.lastIndexOf('}')
-            if (jsonStart != -1 && jsonEnd > jsonStart) {
-                val jsonStr = trimmed.substring(jsonStart, jsonEnd + 1)
-                val jsonObj = JSONObject(jsonStr)
-                if (jsonObj.has("tool")) {
-                    val toolName = jsonObj.getString("tool")
-                    val argsMap = mutableMapOf<String, String>()
-                    if (jsonObj.has("args")) {
-                        val argsObj = jsonObj.getJSONObject("args")
-                        argsObj.keys().forEach { key ->
-                            argsMap[key] = argsObj.optString(key, "")
-                        }
-                    }
-                    return Pair(toolName, argsMap)
-                }
-            }
-            null
-        } catch (_: Exception) { null }
-    }
-
-    private fun trimHistory() {
-        while (conversationHistory.size > MAX_HISTORY) {
-            conversationHistory.removeFirst()
-        }
-    }
-
-    // ── Kural Motoru (gelişmiş) ──
-
+    // ── Kural Motoru (fallback) ──
     private fun simulateRuleFallback(userInput: String): String {
         val lower = userInput.lowercase().trim()
-            .replace("[.!?,;]".toRegex(), " ")
+            .replace("[.!?,;:]".toRegex(), " ")
             .replace("\\s+".toRegex(), " ")
             .trim()
 
@@ -325,102 +382,32 @@ class LocalAgentManager(private val context: Context) {
         if (setOf("hava", "weather", "sıcaklık", "derece", "yağmur", "kar", "rüzgar", "bulut", "güneş").any { it in lower }) {
             return """{"tool": "terminal", "args": {"command": "curl -s 'wttr.in/Istanbul?format=%C+%t+%w'"}}"""
         }
-
-        // Ping
-        if ("ping" in lower && "pingle" !in lower) {
-            val target = when {
-                "8.8.8.8" in lower -> "8.8.8.8"
-                "google" in lower -> "google.com"
-                else -> "1.1.1.1"
-            }
-            return """{"tool": "terminal", "args": {"command": "ping -c 4 $target"}}"""
-        }
-
-        // Tarih/Saat
-        if (setOf("tarih", "saat", "zaman", "gün", "date", "time", "bugün günlerden").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "date '+%A, %d %B %Y - %H:%M:%S'"}}"""
-        }
-
-        // Depolama
-        if (setOf("depolama", "hafıza", "disk", "sd kart", "boş alan", "kullanılan", "storage", "gb", "bayt").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null; echo '---RAM---'; free -h 2>/dev/null"}}"""
-        }
-
-        // CPU
-        if (setOf("cpu", "işlemci", "processor", "çekirdek").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "cat /proc/cpuinfo 2>/dev/null | grep -E 'processor|model name|Hardware' | head -10"}}"""
-        }
-
-        // RAM
-        if (setOf("ram", "bellek", "memory").any { it in lower }) {
-            return """{"tool": "device_info", "args": {}}"""
-        }
-
-        // Ağ / IP
-        if (setOf("ağ", "network", "ip", "mac", "bağlantı durumu", "modem", "router").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null | grep -E 'inet|link' || ifconfig"}}"""
-        }
-
-        // Kimler bağlı
-        if (setOf("kimler", "kim bağlı", "oturum", "online", "who").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "who 2>/dev/null; echo '---PROC---'; ps -A 2>/dev/null | head -10"}}"""
-        }
-
-        // Uygulama listesi
-        if (setOf("uygulama listele", "yüklü uygulama", "paket listele", "hangi uygulama", "program listele").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "pm list packages 2>/dev/null | awk -F: '{print \$2}' | sort | head -40"}}"""
-        }
-
-        // Dosya listele
-        if (setOf("dosya listele", "klasör", "dizin", "göster", "neler var", "ls").any { it in lower }) {
-            val path = if ("indir" in lower || "download" in lower) "/sdcard/Download" else "/sdcard"
-            return """{"tool": "terminal", "args": {"command": "ls -la '$path' 2>/dev/null | head -30"}}"""
-        }
-
-        // Uptime
-        if (setOf("uptime", "çalışma süresi", "açık kalma", "ne zamandır").any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "uptime"}}"""
-        }
-
-        // ── Özel Araçlar ──
-
         // Pil
         if (setOf("şarj", "pil", "batarya", "battery", "yüzde", "dolum", "enerji", "charge").any { it in lower }) {
             return """{"tool": "get_battery", "args": {}}"""
         }
-
         // Cihaz bilgisi
-        if (setOf("cihaz", "model", "telefon", "sistem", "özellik", "bilgi", "info", "donanım", "hardware", "android").any { it in lower }) {
+        if (setOf("cihaz", "model", "telefon", "sistem", "özellik", "bilgi", "info", "donanım", "hardware").any { it in lower }) {
             return """{"tool": "device_info", "args": {}}"""
         }
-
         // Wi-Fi
         if (setOf("wifi", "wi-fi", "internet", "bağlantı", "network").any { it in lower }) {
             return """{"tool": "get_wifi_status", "args": {}}"""
         }
-
         // Not al
         if (setOf("not et", "hatırla", "kaydet", "not al", "not tut", "unutma", "yaz", "aklımda").any { it in lower }) {
             return """{"tool": "write_note", "args": {"text": "$userInput"}}"""
         }
-
-        // Not oku
-        if (setOf("notlar", "notlarım", "hafıza", "listele").any { it in lower }) {
-            return """{"tool": "read_notes", "args": {}}"""
-        }
-
         // Kamera
         if (setOf("kamera", "fotoğraf", "çek", "selfie", "foto", "resim").any { it in lower }) {
             return """{"tool": "open_camera", "args": {}}"""
         }
-
         // Flaş
         if (setOf("flaş", "fener", "ışık", "flash", "torch", "lamba", "el feneri").any { it in lower }) {
             val state = if (lower.contains("kapat") || lower.contains("söndür") || lower.contains("off")) "off" else "on"
             return """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
         }
-
-        // Uygulama Açma
+        // Uygulama açma (gelişmiş regex ile)
         val acmaRegex = Regex("""(.{2,25})['’]?(i|ı|yi|yı|e|a|ye|ya|ü|u|yu|yü)?\s*(aç|başlat|çalıştır|gir|start|launch|open)\b""", RegexOption.IGNORE_CASE)
         val match = acmaRegex.find(lower)
         if (match != null) {
@@ -431,20 +418,25 @@ class LocalAgentManager(private val context: Context) {
             }
         }
 
-        // Alternatif uygulama açma
-        if (setOf("aç", "açar", "açılsın", "başlat", "çalıştır", "gir", "girelim").any { it in lower }) {
-            val words = lower.split(" ")
-            val acIndex = words.indexOfFirst { it in setOf("aç", "açar", "açılsın", "açsana", "başlat", "başlatır", "çalıştır", "gir", "girelim") }
-            if (acIndex >= 1) {
-                var appName = words.subList(0, acIndex).joinToString(" ")
-                appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "").trim()
-                if (appName.length in 2..25) {
-                    return """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
-                }
-            }
-        }
-
         return ""
+    }
+
+    private fun formatSimpleResult(toolName: String, result: ToolResult): String {
+        return when (toolName) {
+            "get_battery" -> result.result.replace("Mevcut batarya seviyesi: %", "Pil seviyen: %")
+            "get_wifi_status" -> result.result.replace("Ağ Durumu:", "Bağlantı:")
+            "device_info" -> result.result
+            "open_app" -> result.result
+            "toggle_flash" -> result.result
+            "terminal" -> result.result.lines().filter { it.isNotBlank() }.joinToString("\n")
+            else -> result.result
+        }
+    }
+
+    private fun trimHistory() {
+        while (conversationHistory.size > MAX_HISTORY) {
+            conversationHistory.removeFirst()
+        }
     }
 }
 
