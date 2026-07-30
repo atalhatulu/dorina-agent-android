@@ -21,12 +21,34 @@ class LocalAgentManager(private val context: Context) {
 
     private val OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
+    // ── Bellek (konuşma geçmişi) ──
+    private val conversationHistory = mutableListOf<Pair<String, String>>()  // (user, assistant)
+    private val MAX_HISTORY = 6  // son 3 diyalogu hatırla
+
+    data class ToolDef(
+        val name: String,
+        val description: String,
+        val args: String
+    )
+
+    private val availableTools = listOf(
+        ToolDef("get_battery", "Pil/seviye öğrenme", "{}"),
+        ToolDef("get_wifi_status", "Wi-Fi/internet bağlantı durumu", "{}"),
+        ToolDef("device_info", "Cihaz model, RAM, depolama bilgisi", "{}"),
+        ToolDef("terminal", "Her türlü shell/terminal komutu. ping, dosya işlemleri, curl, sistem bilgisi", "{\"command\": \"...\"}"),
+        ToolDef("open_camera", "Kamerayı açar", "{}"),
+        ToolDef("toggle_flash", "Feneri açar/kapatır", "{\"state\": \"on/off\"}"),
+        ToolDef("open_app", "Bir uygulamayı açar", "{\"app_name\": \"WhatsApp\"}"),
+        ToolDef("write_note", "Not kaydeder", "{\"text\": \"...\"}"),
+        ToolDef("read_notes", "Kayıtlı notları okur", "{}"),
+        ToolDef("read_file", "Dosya okur", "{\"file_name\": \"...\"}")
+    )
+
     init {
         autoDiscoverAndInitializeModel()
     }
 
     // ── Model Keşfi ──
-
     private fun autoDiscoverAndInitializeModel() {
         val searchPaths = listOf(
             "/sdcard/Download/gemma-2b-it-gpu-int4.bin",
@@ -35,144 +57,136 @@ class LocalAgentManager(private val context: Context) {
             "${context.getExternalFilesDir(null)}/gemma-2b-it-gpu-int4.bin",
             "${context.getExternalFilesDir(null)}/gemma-2b-it-cpu.bin"
         )
-
         for (path in searchPaths) {
             val file = File(path)
             if (file.exists() && file.length() > 50_000_000) {
                 if (initializeMediaPipe(path)) return
             }
         }
-
-        if (checkOllamaConnection()) {
-            activeEngineName = "Ollama Local (gemma:2b)"
-        } else {
-            activeEngineName = "Kural Motoru (Offline)"
-        }
+        activeEngineName = if (checkOllamaConnection()) "Ollama" else "Kural Motoru"
     }
 
     fun initializeMediaPipe(modelPath: String): Boolean {
         return try {
             val file = File(modelPath)
             if (!file.exists()) return false
-
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(modelPath)
                 .setMaxTokens(1024)
                 .setTopK(40)
                 .setTemperature(0.7f)
-                .setResultListener { partialResult, done -> }
+                .setResultListener { _, _ -> }
                 .build()
-
             llmInference = LlmInference.createFromOptions(context, options)
             isInitialized = true
-            activeEngineName = "MediaPipe GenAI (${file.name})"
+            activeEngineName = "MediaPipe (${file.name})"
             true
         } catch (e: Exception) {
-            Timber.e(e, "Failed to initialize MediaPipe model at $modelPath")
+            Timber.e(e, "MediaPipe init failed at $modelPath")
             false
         }
     }
 
-    // ── Ana Sorgu İşleme ──
+    // ── ANA AGENT LOOP ──
 
     suspend fun processQuery(userInput: String): Flow<AgentState> = flow {
-        emit(AgentState.Thinking("Sorgu işleniyor..."))
+        emit(AgentState.Thinking("Anlamaya çalışıyorum..."))
 
-        // 1. ÖNCE kural motoru dene (hızlı ve güvenilir)
+        // 1. Önce Kural Motoru (hızlı, LLM gerektirmez)
         val ruleResult = simulateRuleFallback(userInput)
         val ruleToolCall = parseJsonToolCall(ruleResult)
-
         if (ruleToolCall != null) {
-            // Kural motoru bir tool buldu → çalıştır
             val (toolName, args) = ruleToolCall
             emit(AgentState.ExecutingTool(toolName, args))
             val toolResult = ToolRegistry.executeTool(context, toolName, args)
-            emit(AgentState.Thinking("Sonuç işleniyor..."))
 
-            // LLM varsa sonucu özetlet, yoksa direkt göster
-            val answer = summarizeWithLLM(userInput, toolName, toolResult)
-            emit(AgentState.Completed(answer, toolResult))
+            val summary = summarizeWithLLM(userInput, toolName, toolResult)
+            conversationHistory.add(userInput to summary)
+            trimHistory()
+
+            emit(AgentState.Completed(summary, toolResult))
             return@flow
         }
 
-        // 2. Kural motoru bir şey bulamadı → LLM'e sor (varsa)
-        emit(AgentState.Thinking("Anlamaya çalışıyorum..."))
+        // 2. LLM İLE KARAR VERME (sınıflandırma + tool seçimi)
+        if (isInitialized && llmInference != null || checkOllamaConnection()) {
+            val llmDecision = askLLM(userInput)
+            val toolCall = parseJsonToolCall(llmDecision)
 
-        if (isInitialized && llmInference != null) {
-            // MediaPipe ile basit sınıflandırma
-            val llmResponse = try {
-                llmInference?.generateResponse(buildClassifyPrompt(userInput)) ?: ""
-            } catch (e: Exception) {
-                queryOllamaOrFallback(userInput)
-            }
-
-            val llmToolCall = parseJsonToolCall(llmResponse)
-            if (llmToolCall != null) {
-                val (toolName, args) = llmToolCall
+            if (toolCall != null) {
+                val (toolName, args) = toolCall
                 emit(AgentState.ExecutingTool(toolName, args))
                 val toolResult = ToolRegistry.executeTool(context, toolName, args)
-                val answer = summarizeWithLLM(userInput, toolName, toolResult, llmResponse)
-                emit(AgentState.Completed(answer, toolResult))
+
+                val summary = summarizeWithLLM(userInput, toolName, toolResult, llmDecision)
+                conversationHistory.add(userInput to summary)
+                trimHistory()
+
+                emit(AgentState.Completed(summary, toolResult))
                 return@flow
             }
 
-            // LLM JSON döndürmedi ama anlamlı bir cevap verdi mi?
-            if (llmResponse.isNotBlank() && llmResponse.length > 10) {
-                emit(AgentState.Completed(llmResponse, null))
+            // LLM tool çağırmadı ama anlamlı cevap verdi
+            if (llmDecision.isNotBlank() && llmDecision.length > 8) {
+                conversationHistory.add(userInput to llmDecision)
+                trimHistory()
+                emit(AgentState.Completed(llmDecision, null))
                 return@flow
             }
         }
 
-        // 3. Ollama dene
-        val ollamaResponse = queryOllama(userInput)
-        if (ollamaResponse != null) {
-            val ollamaToolCall = parseJsonToolCall(ollamaResponse)
-            if (ollamaToolCall != null) {
-                val (toolName, args) = ollamaToolCall
-                emit(AgentState.ExecutingTool(toolName, args))
-                val toolResult = ToolRegistry.executeTool(context, toolName, args)
-                val answer = summarizeWithLLM(userInput, toolName, toolResult)
-                emit(AgentState.Completed(answer, toolResult))
-                return@flow
-            }
-            if (ollamaResponse.isNotBlank() && ollamaResponse.length > 10) {
-                emit(AgentState.Completed(ollamaResponse, null))
-                return@flow
-            }
-        }
-
-        // 4. Hiçbir şey işe yaramadı
+        // 3. Hiçbir şey işe yaramadı
         emit(AgentState.Completed(
-            "Anlayamadım. Ne yapmamı istersin? " +
-            "Örnek: pil kaç, hava durumu, Instagram'ı aç, ping at, not al",
+            "Şu anda ne yapacağımı bilemedim.\n" +
+            "Şunları deneyebilirsin:\n" +
+            "• \"Pil kaç\" — pil durumu\n" +
+            "• \"Hava nasıl\" — hava durumu\n" +
+            "• \"WhatsApp'ı aç\" — uygulama aç\n" +
+            "• \"ping 8.8.8.8\" — ağ testi\n" +
+            "• \"not al: toplantı 15:00\" — hatırlatıcı",
             null
         ))
     }.flowOn(Dispatchers.IO)
 
-    // ── LLM Sınıflandırma Promptu (basit, JSON odaklı) ──
+    // ── LLM Karar Verme ──
 
-    private fun buildClassifyPrompt(userInput: String): String {
-        return """
+    private fun askLLM(userInput: String): String {
+        // Geçmişi ekle
+        val historyBlock = conversationHistory.takeLast(4).joinToString("\n") { (u, a) ->
+            "Kullanıcı: $u\nDorina: $a"
+        }
+
+        val toolList = availableTools.joinToString("\n") {
+            "  • ${it.name} - ${it.description} (args: ${it.args})"
+        }
+
+        val prompt = """
+            $historyBlock
+            
             Kullanıcı: $userInput
-
-            Yukarıdaki isteğe göre uygun aracı seç ve SADECE JSON çıktısı ver.
-            Eğer hiçbir araç uygun değilse, doğrudan Türkçe cevap ver.
-
+            
+            Sen Dorina'sın. Kullanıcının isteğini anla ve en uygun aracı seç.
+            
             ARAÇLAR:
-            {"tool": "get_battery", "args": {}} — pil/şarj/batarya soruları için
-            {"tool": "get_wifi_status", "args": {}} — internet/wifi bağlantı soruları için
-            {"tool": "device_info", "args": {}} — cihaz/model/sistem bilgisi için
-            {"tool": "terminal", "args": {"command": "curl -s wttr.in/Istanbul?format=3"}} — hava durumu için
-            {"tool": "terminal", "args": {"command": "..."}} — her türlü terminal komutu, ping, sistem bilgisi, dosya listesi
-            {"tool": "open_camera", "args": {}} — kamerayı açmak için
-            {"tool": "toggle_flash", "args": {"state": "on"}} — feneri yakmak için
-            {"tool": "open_app", "args": {"app_name": "WhatsApp"}} — uygulama açmak için
-            {"tool": "write_note", "args": {"text": "not"}} — not almak için
-            {"tool": "read_notes", "args": {}} — notları okumak için
-            {"tool": "read_file", "args": {"file_name": "dosya.txt"}} — dosya okumak için
+            $toolList
 
+            KURALLAR:
+            - Sadece yukarıdaki araçlardan birini seç
+            - Cevap SADECE JSON olmalı: {"tool": "...", "args": {...}}
+            - Hiçbir araç uygun değilse normal Türkçe cevap ver
+            
             CEVAP:
         """.trimIndent()
+
+        // MediaPipe dene
+        if (isInitialized && llmInference != null) {
+            try {
+                return llmInference?.generateResponse(prompt) ?: ""
+            } catch (_: Exception) {}
+        }
+
+        // Ollama dene
+        return queryOllama(prompt) ?: ""
     }
 
     // ── LLM ile Özetleme ──
@@ -183,31 +197,44 @@ class LocalAgentManager(private val context: Context) {
         result: ToolResult,
         llmHint: String? = null
     ): String {
-        val prompt = """
-            Kullanıcı: $userQuery
-            Araç: $toolName
-            ${if (llmHint != null) "Ham Cevap: $llmHint" else ""}
-            Sonuç: ${result.result}
+        if (result.success) {
+            // LLM varsa sonucu doğal dile çevir
+            val prompt = """
+                Kullanıcı: $userQuery
+                Araç: $toolName
+                ${if (llmHint != null) "Seçim: $llmHint" else ""}
+                Sonuç: ${result.result}
+                
+                Kullanıcıya sonucu kısa ve doğal Türkçe ile söyle. Aracın adını söyleme, direkt cevap ver.
+            """.trimIndent()
 
-            Kullanıcıya sonucu kısa ve doğal Türkçe ile söyle. Başarısızsa hatayı açıkla.
-        """.trimIndent()
+            if (isInitialized && llmInference != null) {
+                try {
+                    val r = llmInference?.generateResponse(prompt) ?: ""
+                    if (r.length > 10) return r
+                } catch (_: Exception) {}
+            }
 
-        if (isInitialized && llmInference != null) {
-            try {
-                val response = llmInference?.generateResponse(prompt) ?: ""
-                if (response.isNotBlank() && response.length > 10) return response
-            } catch (_: Exception) {}
-        }
+            val ollamaR = queryOllama(prompt)
+            if (ollamaR != null && ollamaR.length > 10) return ollamaR
 
-        // Ollama ile dene
-        val ollamaResponse = queryOllama(prompt)
-        if (ollamaResponse != null && ollamaResponse.length > 10) return ollamaResponse
-
-        // LLM yoksa direkt sonucu göster
-        return if (result.success) {
-            "✅ $toolName:\n${result.result}"
+            // LLM yoksa formatlı düz metin
+            return formatToolResult(toolName, result)
         } else {
-            "❌ $toolName hatası: ${result.result}"
+            return "❌ $toolName hatası: ${result.result}"
+        }
+    }
+
+    private fun formatToolResult(toolName: String, result: ToolResult): String {
+        return when (toolName) {
+            "get_battery" -> result.result.replace("Mevcut batarya seviyesi: %", "Pil seviyen: %")
+            "get_wifi_status" -> result.result.replace("Ağ Durumu:", "Bağlantı:")
+            "device_info" -> result.result
+            "terminal" -> {
+                val lines = result.result.lines().filter { it.isNotBlank() }
+                lines.joinToString("\n")
+            }
+            else -> result.result
         }
     }
 
@@ -223,7 +250,7 @@ class LocalAgentManager(private val context: Context) {
             val code = conn.responseCode
             conn.disconnect()
             code == 200
-        } catch (e: Exception) { false }
+        } catch (_: Exception) { false }
     }
 
     private fun queryOllama(prompt: String): String? {
@@ -233,33 +260,25 @@ class LocalAgentManager(private val context: Context) {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
             conn.connectTimeout = 3000
-            conn.readTimeout = 15000
+            conn.readTimeout = 30000
             conn.doOutput = true
-
             val jsonBody = JSONObject().apply {
                 put("model", "gemma:2b")
                 put("prompt", prompt)
                 put("stream", false)
             }
-
             conn.outputStream.use { os ->
                 os.write(jsonBody.toString().toByteArray(Charsets.UTF_8))
             }
-
             if (conn.responseCode == 200) {
                 val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
                 val responseJson = JSONObject(responseStr)
-                activeEngineName = "Ollama"
                 responseJson.optString("response", null)
             } else null
         } catch (e: Exception) {
-            Timber.w("Ollama error: ${e.message}")
+            Timber.w("Ollama: ${e.message}")
             null
         }
-    }
-
-    private fun queryOllamaOrFallback(input: String): String {
-        return queryOllama(buildClassifyPrompt(input)) ?: ""
     }
 
     // ── JSON Ayrıştırıcı ──
@@ -278,17 +297,23 @@ class LocalAgentManager(private val context: Context) {
                     if (jsonObj.has("args")) {
                         val argsObj = jsonObj.getJSONObject("args")
                         argsObj.keys().forEach { key ->
-                            argsMap[key] = argsObj.getString(key)
+                            argsMap[key] = argsObj.optString(key, "")
                         }
                     }
                     return Pair(toolName, argsMap)
                 }
             }
             null
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
     }
 
-    // ── Gelişmiş Kural Motoru ──
+    private fun trimHistory() {
+        while (conversationHistory.size > MAX_HISTORY) {
+            conversationHistory.removeFirst()
+        }
+    }
+
+    // ── Kural Motoru (gelişmiş) ──
 
     private fun simulateRuleFallback(userInput: String): String {
         val lower = userInput.lowercase().trim()
@@ -296,153 +321,129 @@ class LocalAgentManager(private val context: Context) {
             .replace("\\s+".toRegex(), " ")
             .trim()
 
-        // ── Terminal komutları ──
+        // Hava durumu
+        if (setOf("hava", "weather", "sıcaklık", "derece", "yağmur", "kar", "rüzgar", "bulut", "güneş").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "curl -s 'wttr.in/Istanbul?format=%C+%t+%w'"}}"""
+        }
 
-        if (lower.contains("ping") && !lower.contains("pingle") && !lower.contains("ping at")) {
+        // Ping
+        if ("ping" in lower && "pingle" !in lower) {
             val target = when {
                 "8.8.8.8" in lower -> "8.8.8.8"
                 "google" in lower -> "google.com"
-                "1.1.1.1" in lower -> "1.1.1.1"
                 else -> "1.1.1.1"
             }
             return """{"tool": "terminal", "args": {"command": "ping -c 4 $target"}}"""
         }
 
-        // Hava durumu
-        val havaKelime = setOf("hava", "weather", "sıcaklık", "derece", "yağmur", "kar", "rüzgar", "bulut")
-        if (havaKelime.any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "curl -s 'wttr.in/Istanbul?format=%C+%t+%w&m' 2>/dev/null"}}"""
+        // Tarih/Saat
+        if (setOf("tarih", "saat", "zaman", "gün", "date", "time", "bugün günlerden").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "date '+%A, %d %B %Y - %H:%M:%S'"}}"""
         }
 
-        // Tarih / saat
-        val zamanKelime = setOf("tarih", "saat", "zaman", "gün", "ay", "yıl", "date", "time", "bugün günlerden")
-        if (zamanKelime.any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "date '+%A, %d %B %Y - %H:%M:%S' 2>/dev/null || date"}}"""
+        // Depolama
+        if (setOf("depolama", "hafıza", "disk", "sd kart", "boş alan", "kullanılan", "storage", "gb", "bayt").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null; echo '---RAM---'; free -h 2>/dev/null"}}"""
         }
 
-        // Depolama / disk
-        val depolamaKelime = setOf("depolama", "hafıza", "disk", "sd kart", "boş alan", "kullanılan alan",
-            "storage", "memory", "space", "gb")
-        if (depolamaKelime.any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null; echo '---'; free -h 2>/dev/null"}}"""
-        }
-
-        // İşlemci / CPU
-        if (lower.contains("cpu") || lower.contains("işlemci") || lower.contains("processor") || lower.contains("çekirdek")) {
+        // CPU
+        if (setOf("cpu", "işlemci", "processor", "çekirdek").any { it in lower }) {
             return """{"tool": "terminal", "args": {"command": "cat /proc/cpuinfo 2>/dev/null | grep -E 'processor|model name|Hardware' | head -10"}}"""
         }
 
-        // RAM / bellek
-        if (lower.contains("ram") || lower.contains("bellek") || lower.contains("memory")) {
+        // RAM
+        if (setOf("ram", "bellek", "memory").any { it in lower }) {
             return """{"tool": "device_info", "args": {}}"""
         }
 
         // Ağ / IP
-        val agKelime = setOf("ağ", "network", "ip", "mac adres", "ağ ayarları", "bağlantı durumu")
-        if (agKelime.any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null | grep -E 'inet|link' || ifconfig 2>/dev/null"}}"""
+        if (setOf("ağ", "network", "ip", "mac", "bağlantı durumu", "modem", "router").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null | grep -E 'inet|link' || ifconfig"}}"""
+        }
+
+        // Kimler bağlı
+        if (setOf("kimler", "kim bağlı", "oturum", "online", "who").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "who 2>/dev/null; echo '---PROC---'; ps -A 2>/dev/null | head -10"}}"""
         }
 
         // Uygulama listesi
-        val uygulamaKelime = setOf("uygulama listele", "yüklü uygulama", "paket listele", "hangi uygulama")
-        if (uygulamaKelime.any { it in lower }) {
+        if (setOf("uygulama listele", "yüklü uygulama", "paket listele", "hangi uygulama", "program listele").any { it in lower }) {
             return """{"tool": "terminal", "args": {"command": "pm list packages 2>/dev/null | awk -F: '{print \$2}' | sort | head -40"}}"""
         }
 
         // Dosya listele
-        val dosyaKelime = setOf("dosya listele", "klasör", "dizin", "ls", "göster", "neler var")
-        if (dosyaKelime.any { it in lower }) {
+        if (setOf("dosya listele", "klasör", "dizin", "göster", "neler var", "ls").any { it in lower }) {
             val path = if ("indir" in lower || "download" in lower) "/sdcard/Download" else "/sdcard"
             return """{"tool": "terminal", "args": {"command": "ls -la '$path' 2>/dev/null | head -30"}}"""
         }
 
-        // Kimler bağlı / login
-        val kimlerKelime = setOf("kimler", "kim bağlı", "kim online", "oturum", "who")
-        if (kimlerKelime.any { it in lower }) {
-            return """{"tool": "terminal", "args": {"command": "who 2>/dev/null; echo '---'; ps -A 2>/dev/null | head -10"}}"""
+        // Uptime
+        if (setOf("uptime", "çalışma süresi", "açık kalma", "ne zamandır").any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "uptime"}}"""
         }
 
-        // Sistem çalışma süresi
-        if (lower.contains("uptime") || lower.contains("çalışma süresi") || lower.contains("ne zamandır açık") || lower.contains("açık kalma")) {
-            return """{"tool": "terminal", "args": {"command": "uptime; cat /proc/uptime 2>/dev/null | awk '{print \$1/86400 \" gün\"}'"}}"""
-        }
+        // ── Özel Araçlar ──
 
-        // ── Özel araçlar ──
-
-        // Pil / şarj (Genişletilmiş)
-        val pilKelime = setOf("şarj", "pil", "batarya", "battery", "yüzde", "%", "charge", "power", "enerji", "dolum")
-        if (pilKelime.any { it in lower }) {
+        // Pil
+        if (setOf("şarj", "pil", "batarya", "battery", "yüzde", "dolum", "enerji", "charge").any { it in lower }) {
             return """{"tool": "get_battery", "args": {}}"""
         }
 
         // Cihaz bilgisi
-        val cihazKelime = setOf("cihaz", "model", "telefon", "sistem", "özellik", "bilgi", "info", "spec",
-            "donanım", "hardware", "telefonun özellik", "android")
-        if (cihazKelime.any { it in lower }) {
+        if (setOf("cihaz", "model", "telefon", "sistem", "özellik", "bilgi", "info", "donanım", "hardware", "android").any { it in lower }) {
             return """{"tool": "device_info", "args": {}}"""
         }
 
-        // Wi-Fi / internet
-        val wifiKelime = setOf("wifi", "wi-fi", "internet", "bağlantı", "ağ durumu", "network", "modem")
-        if (wifiKelime.any { it in lower }) {
+        // Wi-Fi
+        if (setOf("wifi", "wi-fi", "internet", "bağlantı", "network").any { it in lower }) {
             return """{"tool": "get_wifi_status", "args": {}}"""
         }
 
         // Not al
-        val notAlKelime = setOf("not et", "hatırla", "kaydet", "not al", "not tut", "aklımda kalsın",
-            "unutma", "yaz", "not defteri")
-        if (notAlKelime.any { it in lower }) {
+        if (setOf("not et", "hatırla", "kaydet", "not al", "not tut", "unutma", "yaz", "aklımda").any { it in lower }) {
             return """{"tool": "write_note", "args": {"text": "$userInput"}}"""
         }
 
-        // Notları oku
-        val notOkuKelime = setOf("notlar", "notlarım", "notlarımı göster", "notlarımı oku", "hafıza", "listele")
-        if (notOkuKelime.any { it in lower }) {
+        // Not oku
+        if (setOf("notlar", "notlarım", "hafıza", "listele").any { it in lower }) {
             return """{"tool": "read_notes", "args": {}}"""
         }
 
         // Kamera
-        val kameraKelime = setOf("kamera", "fotoğraf", "çek", "selfie", "foto", "resim", "fotoğraf çek")
-        if (kameraKelime.any { it in lower }) {
+        if (setOf("kamera", "fotoğraf", "çek", "selfie", "foto", "resim").any { it in lower }) {
             return """{"tool": "open_camera", "args": {}}"""
         }
 
-        // Flaş / fener
-        val flasKelime = setOf("flaş", "fener", "ışık", "flash", "torch", "lamba", "el feneri")
-        if (flasKelime.any { it in lower }) {
+        // Flaş
+        if (setOf("flaş", "fener", "ışık", "flash", "torch", "lamba", "el feneri").any { it in lower }) {
             val state = if (lower.contains("kapat") || lower.contains("söndür") || lower.contains("off")) "off" else "on"
             return """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
         }
 
-        // ── Uygulama Açma (gelişmiş) ──
-        // "x'i aç", "x i aç", "x aç", "x başlat", "x çalıştır", "x e gir"
-        val acmaRegex = Regex("""(.{2,30})['’]?(i|ı|yi|yı|e|a|ye|ya|ü|u|yu|yü)?\s*(aç|başlat|çalıştır|gir|start|launch|open)\b""", RegexOption.IGNORE_CASE)
+        // Uygulama Açma
+        val acmaRegex = Regex("""(.{2,25})['’]?(i|ı|yi|yı|e|a|ye|ya|ü|u|yu|yü)?\s*(aç|başlat|çalıştır|gir|start|launch|open)\b""", RegexOption.IGNORE_CASE)
         val match = acmaRegex.find(lower)
         if (match != null) {
             var appName = match.groupValues[1].trim()
-            // Temizlik
-            appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "")
-                .trim()
-            if (appName.length >= 2 && appName.length <= 30) {
+            appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "").trim()
+            if (appName.length in 2..25) {
                 return """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
             }
         }
-        // Alternatif: "aç" kelimesi içeren cümleler
-        val acik = lower.contains("aç") || lower.contains("başlat") || lower.contains("çalıştır") || lower.contains("gir")
-        if (acik) {
+
+        // Alternatif uygulama açma
+        if (setOf("aç", "açar", "açılsın", "başlat", "çalıştır", "gir", "girelim").any { it in lower }) {
             val words = lower.split(" ")
-            val acIndex = words.indexOfFirst { it in listOf("aç", "açar", "açılsın", "açıver", "açsana", "başlat", "başlatır", "çalıştır", "gir", "girelim") }
+            val acIndex = words.indexOfFirst { it in setOf("aç", "açar", "açılsın", "açsana", "başlat", "başlatır", "çalıştır", "gir", "girelim") }
             if (acIndex >= 1) {
                 var appName = words.subList(0, acIndex).joinToString(" ")
-                appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "")
-                    .trim()
-                if (appName.length >= 2 && appName.length <= 30) {
+                appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "").trim()
+                if (appName.length in 2..25) {
                     return """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
                 }
             }
         }
 
-        // ── Tanımlanamadı ──
         return ""
     }
 }
