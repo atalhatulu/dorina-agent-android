@@ -3,6 +3,7 @@ package com.dorina.agent
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.camera2.CameraManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
@@ -10,30 +11,103 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 object ToolRegistry {
 
-    private val ALLOWED_COMMANDS = listOf("ping", "uptime", "date", "echo", "whoami", "uname", "netstat", "ps")
+    // ── Destructive command patterns (from dorina-agent/security.py) ──
+    private val DESTRUCTIVE_PATTERNS = listOf(
+        "rm -rf /", "rm -rf /*", "rm -rf --no-preserve-root",
+        "mkfs", "dd if=", "> /dev/sd", "> /dev/block",
+        ":(){ :|:& };:",  // fork bomb
+        "chmod 777 /", "chown -R",
+        "mv / /dev/null",
+        "wget http://", "curl http://", "bash <(", "sh <(",
+    )
+
+    private val INDIRECT_DESTRUCTIVE = listOf(
+        Regex("""(python|perl|ruby|node)\s+.*(shutil\.rmtree|os\.remove|os\.unlink|File\.delete)"""),
+        Regex("""(python|perl|ruby|node)\s+.*(rm\s+-rf|exec\(|system\(|subprocess)"""),
+        Regex("""shutil\.rmtree\('"]['"]/['"]['"]"""),
+        Regex("""os\.system\('"]['"]rm\s+-rf"""),
+    )
+
+    private fun isDestructive(command: String): Boolean {
+        val cmdLower = command.lowercase().trim()
+
+        for (pattern in DESTRUCTIVE_PATTERNS) {
+            if (pattern in cmdLower) return true
+        }
+
+        for (regex in INDIRECT_DESTRUCTIVE) {
+            if (regex.containsMatchIn(cmdLower)) return true
+        }
+
+        return false
+    }
 
     suspend fun executeTool(context: Context, toolName: String, args: Map<String, String>): ToolResult = withContext(Dispatchers.IO) {
         try {
             when (toolName.lowercase()) {
+                "terminal" -> {
+                    val rawCmd = args["command"] ?: args["cmd"] ?: ""
+                    if (rawCmd.isBlank()) {
+                        return@withContext ToolResult(toolName, false, "Hata: Komut parametresi boş.")
+                    }
+
+                    if (isDestructive(rawCmd)) {
+                        return@withContext ToolResult(
+                            toolName, false,
+                            "Güvenlik Engeli: Bu komut potansiyel olarak tehlikeli algılandı ve engellendi.\n" +
+                            "Komut: $rawCmd"
+                        )
+                    }
+
+                    val timeoutSec = args["timeout"]?.toIntOrNull() ?: 30
+
+                    try {
+                        val result = withTimeout(timeoutSec * 1000L) {
+                            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", rawCmd))
+                            val output = process.inputStream.bufferedReader().readText()
+                            val error = process.errorStream.bufferedReader().readText()
+                            val exited = process.waitFor(30, TimeUnit.SECONDS)
+                            val exitCode = if (exited) process.exitValue() else -1
+
+                            buildString {
+                                if (output.isNotBlank()) append(output.trim())
+                                if (error.isNotBlank()) {
+                                    if (isNotEmpty()) append("\n")
+                                    append("STDERR: ").append(error.trim())
+                                }
+                                if (exitCode != 0) {
+                                    append("\n(Exit code: $exitCode)")
+                                }
+                            }.ifBlank { "Komut çalıştı (exit: $exitCode)" }
+                        }
+                        ToolResult(toolName, true, result)
+                    } catch (e: TimeoutCancellationException) {
+                        ToolResult(toolName, false, "Komut ${timeoutSec}s içinde tamamlanamadı — zaman aşımı.")
+                    }
+                }
+
                 "device_info" -> {
                     val battery = getBatteryLevel(context)
                     val storageMB = getAvailableStorageMB()
                     val wifiInfo = getWifiStatus(context)
-                    val info = """
-                        Cihaz Model: ${Build.MANUFACTURER} ${Build.MODEL}
-                        Android Sürümü: API ${Build.VERSION.SDK_INT} (${Build.VERSION.RELEASE})
-                        Batarya Seviyesi: %$battery
-                        Boş Depolama: ${storageMB / 1024} GB ($storageMB MB)
-                        Bağlantı: $wifiInfo
-                    """.trimIndent()
+                    val info = buildString {
+                        appendLine("Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}")
+                        appendLine("Android: API ${Build.VERSION.SDK_INT} (${Build.VERSION.RELEASE})")
+                        appendLine("Pil: %$battery")
+                        appendLine("Boş Depolama: ${storageMB / 1024} GB ($storageMB MB)")
+                        append("Bağlantı: $wifiInfo")
+                    }
                     ToolResult(toolName, true, info)
                 }
 
@@ -45,30 +119,6 @@ object ToolRegistry {
                 "get_wifi_status" -> {
                     val status = getWifiStatus(context)
                     ToolResult(toolName, true, "Ağ Durumu: $status")
-                }
-
-                "run_safe_command" -> {
-                    val rawCmd = args["command"] ?: args["cmd"] ?: ""
-                    if (rawCmd.isBlank()) {
-                        return@withContext ToolResult(toolName, false, "Hata: Komut parametresi boş.")
-                    }
-
-                    val firstWord = rawCmd.trim().split("\\s+".toRegex()).firstOrNull() ?: ""
-                    if (firstWord !in ALLOWED_COMMANDS) {
-                        return@withContext ToolResult(
-                            toolName,
-                            false,
-                            "Güvenlik Engeli: '$firstWord' komutuna izin yok. İzin verilen komutlar: $ALLOWED_COMMANDS"
-                        )
-                    }
-
-                    val process = Runtime.getRuntime().exec(rawCmd)
-                    val output = process.inputStream.bufferedReader().readText()
-                    val error = process.errorStream.bufferedReader().readText()
-                    process.waitFor()
-
-                    val resultText = if (output.isNotBlank()) output else error
-                    ToolResult(toolName, true, resultText.trim())
                 }
 
                 "read_file" -> {
@@ -129,7 +179,7 @@ object ToolRegistry {
                     val state = args["state"] ?: "on"
                     val turnOn = state.lowercase() == "on"
                     try {
-                        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
                         val cameraId = cameraManager.cameraIdList[0]
                         cameraManager.setTorchMode(cameraId, turnOn)
                         ToolResult(toolName, true, if (turnOn) "Flaş başarıyla açıldı." else "Flaş başarıyla kapatıldı.")
@@ -143,13 +193,17 @@ object ToolRegistry {
                     if (appName.isBlank()) {
                         return@withContext ToolResult(toolName, false, "Lütfen açmak istediğiniz uygulamanın adını belirtin.")
                     }
-                    
-                    // Ekleri temizle (Örn: "snapchati", "whatsapp'ı", "instagrama")
-                    val cleanAppName = appName.replace(Regex("['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü|nin|nın)$", RegexOption.IGNORE_CASE), "").trim()
+
+                    // Türkçe ek temizleyici (örn: "instagram'ı" → "instagram", "whatsapp'a" → "whatsapp")
+                    val cleanAppName = appName.replace(
+                        Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü|nin|nın|nın|nİn)$""", RegexOption.IGNORE_CASE),
+                        ""
+                    ).trim()
 
                     val pm = context.packageManager
                     val packages = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
                     var found = false
+
                     for (app in packages) {
                         val name = pm.getApplicationLabel(app).toString()
                         if (name.contains(cleanAppName, ignoreCase = true)) {
@@ -163,7 +217,7 @@ object ToolRegistry {
                         }
                     }
                     if (!found) {
-                        ToolResult(toolName, false, "$cleanAppName isimli uygulama bulunamadı. (Aranan: $cleanAppName)")
+                        ToolResult(toolName, false, "$cleanAppName isimli uygulama bulunamadı.")
                     } else {
                         ToolResult(toolName, false, "Bilinmeyen bir hata oluştu.")
                     }
@@ -172,13 +226,12 @@ object ToolRegistry {
                 else -> ToolResult(toolName, false, "Bilinmeyen araç: $toolName")
             }
         } catch (e: Exception) {
-            ToolResult(toolName, false, "Araç çalıştırma hatası: ${e.localizedMessage}")
+            ToolResult(toolName, false, "Araç çalıştırma hatası: ${e.localizedMessage ?: e.message ?: "Bilinmeyen hata"}")
         }
     }
 
     private fun getBatteryLevel(context: Context): Int {
-        val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        val batteryStatus = context.registerReceiver(null, intentFilter)
+        val batteryStatus = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         return if (level >= 0 && scale > 0) ((level / scale.toFloat()) * 100).toInt() else -1

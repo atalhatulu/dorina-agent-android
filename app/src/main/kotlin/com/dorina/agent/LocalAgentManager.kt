@@ -22,28 +22,65 @@ class LocalAgentManager(private val context: Context) {
     private val OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
     private val SYSTEM_PROMPT = """
-        Sen Dorina'sın, S24 Ultra cihazında çalışan çok yetenekli, akıllı ve otonom bir yerel yapay zeka asistanısın.
-        Görevin, kullanıcının isteklerini anlamak ve gerekirse aşağıdaki araçları (tools) kullanarak onlara yardımcı olmaktır.
-        
-        AVAILABLE TOOLS (Respond ONLY in JSON if calling a tool):
-        1. device_info - Cihazın RAM, Depolama ve CPU bilgilerini getirir. Args: {}
-        2. get_battery - Telefonun pil (şarj) yüzdesini getirir. Args: {}
-        3. get_wifi_status - İnternet/Wi-Fi bağlantı durumunu kontrol eder. Args: {}
-        4. run_safe_command - Terminal komutu çalıştırır. Args: {"command": "ping 1.1.1.1"}
-        5. read_file - Dosya okur. Args: {"file_name": "notes.txt"}
-        6. write_note - Hafızaya yeni bir not kaydeder. Args: {"text": "Şarjım bitiyor"}
-        7. read_notes - Kaydedilen eski notları okur. Args: {}
-        8. open_camera - Kamerayı açar. Args: {}
-        9. toggle_flash - Flaş ışığını (feneri) açar veya kapatır. Args: {"state": "on" veya "off"}
-        10. open_app - Uygulama açar. Args: {"app_name": "WhatsApp"} (ÖNEMLİ: Ek koyma!).
+        Sen Dorina'sın, cihazda çalışan çok yetenekli, akıllı ve otonom bir yerel yapay zeka asistanısın.
+        Görevin, kullanıcının isteklerini anlamak ve gerekirse aşağıdaki araçları kullanarak onlara yardımcı olmaktır.
 
-        RESPONSE FORMAT RULES:
-        - Eğer yukarıdaki araçlardan (tools) birini kullanman gerekiyorsa, YALNIZCA aşağıdaki gibi ham JSON çıktısı ver:
-        {
-          "tool": "get_battery",
-          "args": {}
-        }
-        - Eğer araç kullanman GEREKMİYORSA (örneğin sohbet ediliyorsa), kullanıcıya doğrudan doğal ve samimi bir Türkçe ile cevap ver. Asla JSON formatı kullanma.
+        ## KULLANILABİLİR ARAÇLAR
+
+        1. **terminal** — Shell komutu çalıştırır. Her türlü sistem bilgisi, dosya işlemi, ağ kontrolü için kullanılır.
+           Args: {"command": "komut satırı", "timeout": 30}
+           Örnek: {"tool": "terminal", "args": {"command": "uname -a && uptime"}}
+           Örnek: {"tool": "terminal", "args": {"command": "dumpsys battery"}}
+           Örnek: {"tool": "terminal", "args": {"command": "ls -la /sdcard/Download/"}}
+
+        2. **device_info** — Cihazın RAM, depolama, CPU, pil ve ağ bilgilerini getirir.
+           Args: {}
+           Örnek: {"tool": "device_info", "args": {}}
+
+        3. **get_battery** — Telefonun pil (şarj) yüzdesini getirir.
+           Args: {}
+           Örnek: {"tool": "get_battery", "args": {}}
+
+        4. **get_wifi_status** — İnternet/Wi-Fi bağlantı durumunu kontrol eder.
+           Args: {}
+           Örnek: {"tool": "get_wifi_status", "args": {}}
+
+        5. **read_file** — Uygulama klasöründen dosya okur.
+           Args: {"file_name": "dosya_adı.txt"}
+           Örnek: {"tool": "read_file", "args": {"file_name": "notes.txt"}}
+
+        6. **write_note** — Hafızaya yeni bir not kaydeder.
+           Args: {"text": "not içeriği"}
+           Örnek: {"tool": "write_note", "args": {"text": "Toplantı saat 14:00"}}
+
+        7. **read_notes** — Kaydedilen tüm notları okur.
+           Args: {}
+           Örnek: {"tool": "read_notes", "args": {}}
+
+        8. **open_camera** — Kamerayı açar.
+           Args: {}
+           Örnek: {"tool": "open_camera", "args": {}}
+
+        9. **toggle_flash** — Flaş ışığını (fener) açar veya kapatır.
+           Args: {"state": "on"} veya {"state": "off"}
+           Örnek: {"tool": "toggle_flash", "args": {"state": "on"}}
+
+        10. **open_app** — Yüklü bir uygulamayı açar.
+            Args: {"app_name": "Uygulama Adı"}
+            Örnek: {"tool": "open_app", "args": {"app_name": "WhatsApp"}}
+
+        ## ÖNEMLİ KURALLAR
+
+        - Bir araç kullanman gerekiyorsa, SADECE aşağıdaki gibi ham JSON çıktısı ver, başka hiçbir şey yazma:
+          {"tool": "araç_adı", "args": {...}}
+
+        - Birden fazla araç gerekiyorsa, ilk aracı JSON olarak döndür. Sonuç sana geri geldiğinde sıradaki aracı çağır.
+
+        - Araç kullanman gerekmiyorsa (sohbet, soru-cevap), doğrudan doğal ve samimi Türkçe ile cevap ver. Asla JSON formatı kullanma.
+
+        - terminal aracı ile neredeyse her şeyi yapabilirsin: dosyaları oku, sistem bilgisi al, ağ durumunu kontrol et, uygulama listesini görüntüle.
+          Örnek: "bugün hava nasıl" → {"tool": "terminal", "args": {"command": "curl -s wttr.in/Istanbul?format=3"}}
+          Örnek: "depolama ne kadar boş" → {"tool": "terminal", "args": {"command": "df -h /sdcard"}}
     """.trimIndent()
 
     init {
@@ -104,7 +141,7 @@ class LocalAgentManager(private val context: Context) {
     suspend fun processQuery(userInput: String): Flow<AgentState> = flow {
         emit(AgentState.Thinking("Sorgu işleniyor [$activeEngineName]..."))
 
-        val fullPrompt = "$SYSTEM_PROMPT\n\nUser: $userInput\nAssistant:"
+        val fullPrompt = "$SYSTEM_PROMPT\n\nKullanıcı: $userInput\nDorina:"
 
         val rawResponse = when {
             isInitialized && llmInference != null -> {
@@ -132,11 +169,11 @@ class LocalAgentManager(private val context: Context) {
             emit(AgentState.Thinking("Araç sonucu özetleniyor..."))
 
             val summarizePrompt = """
-                User Query: $userInput
-                Executed Tool: $toolName
-                Tool Output: ${toolResult.result}
-                
-                Please summarize the result nicely in Turkish for the user.
+                Kullanıcı Sorgusu: $userInput
+                Çalıştırılan Araç: $toolName
+                Araç Çıktısı: ${toolResult.result}
+
+                Lütfen sonucu kullanıcıya güzel bir dille Türkçe özetle. Eğer işlem başarısız olduysa açıkla.
             """.trimIndent()
 
             val finalAnswer = when {
@@ -236,43 +273,89 @@ class LocalAgentManager(private val context: Context) {
     private fun simulateRuleFallback(userInput: String): String {
         val lower = userInput.lowercase()
         return when {
-            lower.contains("şarj") || lower.contains("pil") || lower.contains("batarya") -> {
+            // Terminal / shell komutları
+            lower.contains("ping") -> {
+                val target = when {
+                    "8.8.8.8" in lower -> "8.8.8.8"
+                    "google" in lower -> "google.com"
+                    else -> "1.1.1.1"
+                }
+                """{"tool": "terminal", "args": {"command": "ping -c 4 $target"}}"""
+            }
+            lower.contains("tarih") || lower.contains("saat") || lower.contains("zaman") -> {
+                """{"tool": "terminal", "args": {"command": "date '+%Y-%m-%d %H:%M:%S'"}}"""
+            }
+            lower.contains("unut") && (lower.contains("ma") || lower.contains("me")) -> {
+                """{"tool": "terminal", "args": {"command": "uptime"}}"""
+            }
+            lower.contains("kim") && (lower.contains("login") || lower.contains("bağlı") || lower.contains("online")) -> {
+                """{"tool": "terminal", "args": {"command": "who; echo '---'; ps -A 2>/dev/null | head -20"}}"""
+            }
+            lower.contains("depolama") || lower.contains("hafıza") || lower.contains("disk") || lower.contains("sd kart") -> {
+                """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null"}}"""
+            }
+            lower.contains("işlem") || lower.contains("cpu") || lower.contains("processor") -> {
+                """{"tool": "terminal", "args": {"command": "cat /proc/cpuinfo 2>/dev/null | head -20"}}"""
+            }
+            lower.contains("ram") || lower.contains("bellek") || lower.contains("memory") -> {
+                """{"tool": "terminal", "args": {"command": "free -h 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -10"}}"""
+            }
+            lower.contains("ağ") || lower.contains("network") || lower.contains("ip") -> {
+                """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null || ifconfig 2>/dev/null"}}"""
+            }
+            lower.contains("uygulama") || lower.contains("yüklü") || lower.contains("liste") -> {
+                """{"tool": "terminal", "args": {"command": "pm list packages 2>/dev/null | head -30"}}"""
+            }
+            lower.contains("dosya") && (lower.contains("göster") || lower.contains("listele") || lower.contains("ls")) -> {
+                """{"tool": "terminal", "args": {"command": "ls -la /sdcard/ 2>/dev/null"}}"""
+            }
+
+            // Şarj / pil
+            lower.contains("şarj") || lower.contains("pil") || lower.contains("batarya") || lower.contains("battery") -> {
                 """{"tool": "get_battery", "args": {}}"""
             }
-            lower.contains("sistem") || lower.contains("cihaz") || lower.contains("ram") || lower.contains("depolama") -> {
+
+            // Cihaz bilgisi
+            lower.contains("sistem") || lower.contains("cihaz") || lower.contains("model") || lower.matches(Regex(".*(bilgi|info|özellik).*")) -> {
                 """{"tool": "device_info", "args": {}}"""
             }
-            lower.contains("internet") || lower.contains("wifi") || lower.contains("bağlantı") -> {
+
+            // Wi-Fi / internet
+            lower.contains("internet") || lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("bağlantı") -> {
                 """{"tool": "get_wifi_status", "args": {}}"""
             }
-            lower.contains("not et") || lower.contains("hatırla") || lower.contains("kaydet") -> {
+
+            // Not alma
+            lower.contains("not et") || lower.contains("hatırla") || lower.contains("kaydet") || lower.contains("not al") -> {
                 """{"tool": "write_note", "args": {"text": "$userInput"}}"""
             }
-            lower.contains("notlar") || lower.contains("hafıza") -> {
+
+            // Notları oku
+            lower.contains("notlar") || lower.contains("hafıza") || lower.contains("notlarım") -> {
                 """{"tool": "read_notes", "args": {}}"""
             }
-            lower.contains("ping") -> {
-                val ip = if (lower.contains("8.8.8.8")) "8.8.8.8" else "1.1.1.1"
-                """{"tool": "run_safe_command", "args": {"command": "ping -c 2 $ip"}}"""
-            }
-            lower.contains("tarih") || lower.contains("saat") -> {
-                """{"tool": "run_safe_command", "args": {"command": "date"}}"""
-            }
-            lower.contains("kamera") || lower.contains("fotoğraf") -> {
+
+            // Kamera
+            lower.contains("kamera") || lower.contains("fotoğraf") || lower.contains("çek") -> {
                 """{"tool": "open_camera", "args": {}}"""
             }
+
+            // Flaş
             lower.contains("flaş") || lower.contains("fener") || lower.contains("ışık") || lower.contains("flash") -> {
-                val state = if (lower.contains("kapat")) "off" else "on"
+                val state = if (lower.contains("kapat") || lower.contains("söndür")) "off" else "on"
                 """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
             }
-            lower.contains("aç") && !lower.contains("flaş") && !lower.contains("fener") && !lower.contains("kamera") -> {
-                // Basit kural tabanlı uygulama açma mantığı (Uygulama ismini tahmin eder)
+
+            // Uygulama açma
+            lower.contains("aç") && !lower.contains("flaş") && !lower.contains("fener") && !lower.contains("kamera") && !lower.contains("ışık") -> {
                 val words = lower.split(" ")
                 val appNameIndex = words.indexOf("aç") - 1
                 val appName = if (appNameIndex >= 0) words[appNameIndex] else "Bilinmeyen"
                 """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
             }
-            else -> "Merhaba! Ben Dorina. S24 Ultra cihazınızda yerel AI Ajanınız hizmetinizde. Nasıl yardımcı olabilirim?"
+
+            // Varsayılan
+            else -> "Merhaba! Ben Dorina. Yerel AI Ajanınız hizmetinizde. Nasıl yardımcı olabilirim?"
         }
     }
 }
