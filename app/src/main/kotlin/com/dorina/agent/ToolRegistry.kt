@@ -194,33 +194,58 @@ object ToolRegistry {
                         return@withContext ToolResult(toolName, false, "Lütfen açmak istediğiniz uygulamanın adını belirtin.")
                     }
 
-                    // Türkçe ek temizleyici (örn: "instagram'ı" → "instagram", "whatsapp'a" → "whatsapp")
+                    // Türkçe ek temizleyici
                     val cleanAppName = appName.replace(
-                        Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü|nin|nın|nın|nİn)$""", RegexOption.IGNORE_CASE),
+                        Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü|nin|nın)$""", RegexOption.IGNORE_CASE),
                         ""
-                    ).trim()
+                    ).trim().lowercase()
 
                     val pm = context.packageManager
                     val packages = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
-                    var found = false
 
+                    // 1. Adım: Uygulama etiketi (görünen ad) ile eşleştir
                     for (app in packages) {
-                        val name = pm.getApplicationLabel(app).toString()
-                        if (name.contains(cleanAppName, ignoreCase = true)) {
+                        val label = pm.getApplicationLabel(app).toString()
+                        if (label.lowercase().contains(cleanAppName)) {
                             val launchIntent = pm.getLaunchIntentForPackage(app.packageName)
                             if (launchIntent != null) {
                                 launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 context.startActivity(launchIntent)
-                                found = true
-                                return@withContext ToolResult(toolName, true, "$name başarıyla açıldı.")
+                                return@withContext ToolResult(toolName, true, "$label başarıyla açıldı.")
                             }
                         }
                     }
-                    if (!found) {
-                        ToolResult(toolName, false, "$cleanAppName isimli uygulama bulunamadı.")
-                    } else {
-                        ToolResult(toolName, false, "Bilinmeyen bir hata oluştu.")
+
+                    // 2. Adım: Paket adı ile dene (örn: "com.whatsapp")
+                    for (app in packages) {
+                        if (app.packageName.lowercase().contains(cleanAppName)) {
+                            val launchIntent = pm.getLaunchIntentForPackage(app.packageName)
+                            if (launchIntent != null) {
+                                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                context.startActivity(launchIntent)
+                                return@withContext ToolResult(
+                                    toolName, true,
+                                    "${pm.getApplicationLabel(app)} başarıyla açıldı."
+                                )
+                            }
+                        }
                     }
+
+                    // 3. Adım: Activity sorgulama (launch intent yoksa)
+                    for (app in packages) {
+                        val label = pm.getApplicationLabel(app).toString()
+                        if (label.lowercase().contains(cleanAppName) || app.packageName.lowercase().contains(cleanAppName)) {
+                            val launchIntent = pm.getLaunchIntentForPackage(app.packageName)
+                            if (launchIntent == null) {
+                                return@withContext ToolResult(
+                                    toolName, false,
+                                    "$label bulundu ancak açılamıyor (launch intent yok)."
+                                )
+                            }
+                        }
+                    }
+
+                    ToolResult(toolName, false, "'$cleanAppName' isimli uygulama bulunamadı.")
                 }
 
                 else -> ToolResult(toolName, false, "Bilinmeyen araç: $toolName")

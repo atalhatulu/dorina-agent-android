@@ -21,71 +21,11 @@ class LocalAgentManager(private val context: Context) {
 
     private val OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
-    private val SYSTEM_PROMPT = """
-        Sen Dorina'sın, cihazda çalışan çok yetenekli, akıllı ve otonom bir yerel yapay zeka asistanısın.
-        Görevin, kullanıcının isteklerini anlamak ve gerekirse aşağıdaki araçları kullanarak onlara yardımcı olmaktır.
-
-        ## KULLANILABİLİR ARAÇLAR
-
-        1. **terminal** — Shell komutu çalıştırır. Her türlü sistem bilgisi, dosya işlemi, ağ kontrolü için kullanılır.
-           Args: {"command": "komut satırı", "timeout": 30}
-           Örnek: {"tool": "terminal", "args": {"command": "uname -a && uptime"}}
-           Örnek: {"tool": "terminal", "args": {"command": "dumpsys battery"}}
-           Örnek: {"tool": "terminal", "args": {"command": "ls -la /sdcard/Download/"}}
-
-        2. **device_info** — Cihazın RAM, depolama, CPU, pil ve ağ bilgilerini getirir.
-           Args: {}
-           Örnek: {"tool": "device_info", "args": {}}
-
-        3. **get_battery** — Telefonun pil (şarj) yüzdesini getirir.
-           Args: {}
-           Örnek: {"tool": "get_battery", "args": {}}
-
-        4. **get_wifi_status** — İnternet/Wi-Fi bağlantı durumunu kontrol eder.
-           Args: {}
-           Örnek: {"tool": "get_wifi_status", "args": {}}
-
-        5. **read_file** — Uygulama klasöründen dosya okur.
-           Args: {"file_name": "dosya_adı.txt"}
-           Örnek: {"tool": "read_file", "args": {"file_name": "notes.txt"}}
-
-        6. **write_note** — Hafızaya yeni bir not kaydeder.
-           Args: {"text": "not içeriği"}
-           Örnek: {"tool": "write_note", "args": {"text": "Toplantı saat 14:00"}}
-
-        7. **read_notes** — Kaydedilen tüm notları okur.
-           Args: {}
-           Örnek: {"tool": "read_notes", "args": {}}
-
-        8. **open_camera** — Kamerayı açar.
-           Args: {}
-           Örnek: {"tool": "open_camera", "args": {}}
-
-        9. **toggle_flash** — Flaş ışığını (fener) açar veya kapatır.
-           Args: {"state": "on"} veya {"state": "off"}
-           Örnek: {"tool": "toggle_flash", "args": {"state": "on"}}
-
-        10. **open_app** — Yüklü bir uygulamayı açar.
-            Args: {"app_name": "Uygulama Adı"}
-            Örnek: {"tool": "open_app", "args": {"app_name": "WhatsApp"}}
-
-        ## ÖNEMLİ KURALLAR
-
-        - Bir araç kullanman gerekiyorsa, SADECE aşağıdaki gibi ham JSON çıktısı ver, başka hiçbir şey yazma:
-          {"tool": "araç_adı", "args": {...}}
-
-        - Birden fazla araç gerekiyorsa, ilk aracı JSON olarak döndür. Sonuç sana geri geldiğinde sıradaki aracı çağır.
-
-        - Araç kullanman gerekmiyorsa (sohbet, soru-cevap), doğrudan doğal ve samimi Türkçe ile cevap ver. Asla JSON formatı kullanma.
-
-        - terminal aracı ile neredeyse her şeyi yapabilirsin: dosyaları oku, sistem bilgisi al, ağ durumunu kontrol et, uygulama listesini görüntüle.
-          Örnek: "bugün hava nasıl" → {"tool": "terminal", "args": {"command": "curl -s wttr.in/Istanbul?format=3"}}
-          Örnek: "depolama ne kadar boş" → {"tool": "terminal", "args": {"command": "df -h /sdcard"}}
-    """.trimIndent()
-
     init {
         autoDiscoverAndInitializeModel()
     }
+
+    // ── Model Keşfi ──
 
     private fun autoDiscoverAndInitializeModel() {
         val searchPaths = listOf(
@@ -99,19 +39,14 @@ class LocalAgentManager(private val context: Context) {
         for (path in searchPaths) {
             val file = File(path)
             if (file.exists() && file.length() > 50_000_000) {
-                if (initializeMediaPipe(path)) {
-                    activeEngineName = "MediaPipe GenAI (${file.name})"
-                    return
-                }
+                if (initializeMediaPipe(path)) return
             }
         }
 
-        // Test if Ollama is running
-        val ollamaOk = checkOllamaConnection()
-        if (ollamaOk) {
+        if (checkOllamaConnection()) {
             activeEngineName = "Ollama Local (gemma:2b)"
         } else {
-            activeEngineName = "Local Rule-Engine (Offline Fallback)"
+            activeEngineName = "Kural Motoru (Offline)"
         }
     }
 
@@ -138,62 +73,145 @@ class LocalAgentManager(private val context: Context) {
         }
     }
 
+    // ── Ana Sorgu İşleme ──
+
     suspend fun processQuery(userInput: String): Flow<AgentState> = flow {
-        emit(AgentState.Thinking("Sorgu işleniyor [$activeEngineName]..."))
+        emit(AgentState.Thinking("Sorgu işleniyor..."))
 
-        val fullPrompt = "$SYSTEM_PROMPT\n\nKullanıcı: $userInput\nDorina:"
+        // 1. ÖNCE kural motoru dene (hızlı ve güvenilir)
+        val ruleResult = simulateRuleFallback(userInput)
+        val ruleToolCall = parseJsonToolCall(ruleResult)
 
-        val rawResponse = when {
-            isInitialized && llmInference != null -> {
-                try {
-                    llmInference?.generateResponse(fullPrompt) ?: ""
-                } catch (e: Exception) {
-                    queryOllamaFallback(fullPrompt) ?: simulateRuleFallback(userInput)
-                }
-            }
-            else -> {
-                queryOllamaFallback(fullPrompt) ?: simulateRuleFallback(userInput)
-            }
-        }
-
-        val toolCall = parseToolCall(rawResponse)
-
-        if (toolCall != null) {
-            val toolName = toolCall.first
-            val args = toolCall.second
-
+        if (ruleToolCall != null) {
+            // Kural motoru bir tool buldu → çalıştır
+            val (toolName, args) = ruleToolCall
             emit(AgentState.ExecutingTool(toolName, args))
-
             val toolResult = ToolRegistry.executeTool(context, toolName, args)
+            emit(AgentState.Thinking("Sonuç işleniyor..."))
 
-            emit(AgentState.Thinking("Araç sonucu özetleniyor..."))
+            // LLM varsa sonucu özetlet, yoksa direkt göster
+            val answer = summarizeWithLLM(userInput, toolName, toolResult)
+            emit(AgentState.Completed(answer, toolResult))
+            return@flow
+        }
 
-            val summarizePrompt = """
-                Kullanıcı Sorgusu: $userInput
-                Çalıştırılan Araç: $toolName
-                Araç Çıktısı: ${toolResult.result}
+        // 2. Kural motoru bir şey bulamadı → LLM'e sor (varsa)
+        emit(AgentState.Thinking("Anlamaya çalışıyorum..."))
 
-                Lütfen sonucu kullanıcıya güzel bir dille Türkçe özetle. Eğer işlem başarısız olduysa açıkla.
-            """.trimIndent()
-
-            val finalAnswer = when {
-                isInitialized && llmInference != null -> {
-                    try {
-                        llmInference?.generateResponse(summarizePrompt) ?: toolResult.result
-                    } catch (e: Exception) {
-                        toolResult.result
-                    }
-                }
-                else -> {
-                    queryOllamaFallback(summarizePrompt) ?: "Araç Sonucu ($toolName):\n${toolResult.result}"
-                }
+        if (isInitialized && llmInference != null) {
+            // MediaPipe ile basit sınıflandırma
+            val llmResponse = try {
+                llmInference?.generateResponse(buildClassifyPrompt(userInput)) ?: ""
+            } catch (e: Exception) {
+                queryOllamaOrFallback(userInput)
             }
 
-            emit(AgentState.Completed(finalAnswer, toolResult))
-        } else {
-            emit(AgentState.Completed(rawResponse, null))
+            val llmToolCall = parseJsonToolCall(llmResponse)
+            if (llmToolCall != null) {
+                val (toolName, args) = llmToolCall
+                emit(AgentState.ExecutingTool(toolName, args))
+                val toolResult = ToolRegistry.executeTool(context, toolName, args)
+                val answer = summarizeWithLLM(userInput, toolName, toolResult, llmResponse)
+                emit(AgentState.Completed(answer, toolResult))
+                return@flow
+            }
+
+            // LLM JSON döndürmedi ama anlamlı bir cevap verdi mi?
+            if (llmResponse.isNotBlank() && llmResponse.length > 10) {
+                emit(AgentState.Completed(llmResponse, null))
+                return@flow
+            }
         }
+
+        // 3. Ollama dene
+        val ollamaResponse = queryOllama(userInput)
+        if (ollamaResponse != null) {
+            val ollamaToolCall = parseJsonToolCall(ollamaResponse)
+            if (ollamaToolCall != null) {
+                val (toolName, args) = ollamaToolCall
+                emit(AgentState.ExecutingTool(toolName, args))
+                val toolResult = ToolRegistry.executeTool(context, toolName, args)
+                val answer = summarizeWithLLM(userInput, toolName, toolResult)
+                emit(AgentState.Completed(answer, toolResult))
+                return@flow
+            }
+            if (ollamaResponse.isNotBlank() && ollamaResponse.length > 10) {
+                emit(AgentState.Completed(ollamaResponse, null))
+                return@flow
+            }
+        }
+
+        // 4. Hiçbir şey işe yaramadı
+        emit(AgentState.Completed(
+            "Anlayamadım. Ne yapmamı istersin? " +
+            "Örnek: pil kaç, hava durumu, Instagram'ı aç, ping at, not al",
+            null
+        ))
     }.flowOn(Dispatchers.IO)
+
+    // ── LLM Sınıflandırma Promptu (basit, JSON odaklı) ──
+
+    private fun buildClassifyPrompt(userInput: String): String {
+        return """
+            Kullanıcı: $userInput
+
+            Yukarıdaki isteğe göre uygun aracı seç ve SADECE JSON çıktısı ver.
+            Eğer hiçbir araç uygun değilse, doğrudan Türkçe cevap ver.
+
+            ARAÇLAR:
+            {"tool": "get_battery", "args": {}} — pil/şarj/batarya soruları için
+            {"tool": "get_wifi_status", "args": {}} — internet/wifi bağlantı soruları için
+            {"tool": "device_info", "args": {}} — cihaz/model/sistem bilgisi için
+            {"tool": "terminal", "args": {"command": "curl -s wttr.in/Istanbul?format=3"}} — hava durumu için
+            {"tool": "terminal", "args": {"command": "..."}} — her türlü terminal komutu, ping, sistem bilgisi, dosya listesi
+            {"tool": "open_camera", "args": {}} — kamerayı açmak için
+            {"tool": "toggle_flash", "args": {"state": "on"}} — feneri yakmak için
+            {"tool": "open_app", "args": {"app_name": "WhatsApp"}} — uygulama açmak için
+            {"tool": "write_note", "args": {"text": "not"}} — not almak için
+            {"tool": "read_notes", "args": {}} — notları okumak için
+            {"tool": "read_file", "args": {"file_name": "dosya.txt"}} — dosya okumak için
+
+            CEVAP:
+        """.trimIndent()
+    }
+
+    // ── LLM ile Özetleme ──
+
+    private fun summarizeWithLLM(
+        userQuery: String,
+        toolName: String,
+        result: ToolResult,
+        llmHint: String? = null
+    ): String {
+        val prompt = """
+            Kullanıcı: $userQuery
+            Araç: $toolName
+            ${if (llmHint != null) "Ham Cevap: $llmHint" else ""}
+            Sonuç: ${result.result}
+
+            Kullanıcıya sonucu kısa ve doğal Türkçe ile söyle. Başarısızsa hatayı açıkla.
+        """.trimIndent()
+
+        if (isInitialized && llmInference != null) {
+            try {
+                val response = llmInference?.generateResponse(prompt) ?: ""
+                if (response.isNotBlank() && response.length > 10) return response
+            } catch (_: Exception) {}
+        }
+
+        // Ollama ile dene
+        val ollamaResponse = queryOllama(prompt)
+        if (ollamaResponse != null && ollamaResponse.length > 10) return ollamaResponse
+
+        // LLM yoksa direkt sonucu göster
+        return if (result.success) {
+            "✅ $toolName:\n${result.result}"
+        } else {
+            "❌ $toolName hatası: ${result.result}"
+        }
+    }
+
+    // ── Ollama ──
 
     private fun checkOllamaConnection(): Boolean {
         return try {
@@ -205,12 +223,10 @@ class LocalAgentManager(private val context: Context) {
             val code = conn.responseCode
             conn.disconnect()
             code == 200
-        } catch (e: Exception) {
-            false
-        }
+        } catch (e: Exception) { false }
     }
 
-    private fun queryOllamaFallback(prompt: String): String? {
+    private fun queryOllama(prompt: String): String? {
         return try {
             val url = URL(OLLAMA_URL)
             val conn = url.openConnection() as HttpURLConnection
@@ -233,18 +249,22 @@ class LocalAgentManager(private val context: Context) {
             if (conn.responseCode == 200) {
                 val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
                 val responseJson = JSONObject(responseStr)
-                activeEngineName = "Ollama Local (gemma:2b)"
+                activeEngineName = "Ollama"
                 responseJson.optString("response", null)
-            } else {
-                null
-            }
+            } else null
         } catch (e: Exception) {
-            Timber.w("Ollama local server not reachable: ${e.message}")
+            Timber.w("Ollama error: ${e.message}")
             null
         }
     }
 
-    private fun parseToolCall(response: String): Pair<String, Map<String, String>>? {
+    private fun queryOllamaOrFallback(input: String): String {
+        return queryOllama(buildClassifyPrompt(input)) ?: ""
+    }
+
+    // ── JSON Ayrıştırıcı ──
+
+    private fun parseJsonToolCall(response: String): Pair<String, Map<String, String>>? {
         return try {
             val trimmed = response.trim()
             val jsonStart = trimmed.indexOf('{')
@@ -265,98 +285,165 @@ class LocalAgentManager(private val context: Context) {
                 }
             }
             null
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
+    // ── Gelişmiş Kural Motoru ──
+
     private fun simulateRuleFallback(userInput: String): String {
-        val lower = userInput.lowercase()
-        return when {
-            // Terminal / shell komutları
-            lower.contains("ping") -> {
-                val target = when {
-                    "8.8.8.8" in lower -> "8.8.8.8"
-                    "google" in lower -> "google.com"
-                    else -> "1.1.1.1"
-                }
-                """{"tool": "terminal", "args": {"command": "ping -c 4 $target"}}"""
-            }
-            lower.contains("tarih") || lower.contains("saat") || lower.contains("zaman") -> {
-                """{"tool": "terminal", "args": {"command": "date '+%Y-%m-%d %H:%M:%S'"}}"""
-            }
-            lower.contains("unut") && (lower.contains("ma") || lower.contains("me")) -> {
-                """{"tool": "terminal", "args": {"command": "uptime"}}"""
-            }
-            lower.contains("kim") && (lower.contains("login") || lower.contains("bağlı") || lower.contains("online")) -> {
-                """{"tool": "terminal", "args": {"command": "who; echo '---'; ps -A 2>/dev/null | head -20"}}"""
-            }
-            lower.contains("depolama") || lower.contains("hafıza") || lower.contains("disk") || lower.contains("sd kart") -> {
-                """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null"}}"""
-            }
-            lower.contains("işlem") || lower.contains("cpu") || lower.contains("processor") -> {
-                """{"tool": "terminal", "args": {"command": "cat /proc/cpuinfo 2>/dev/null | head -20"}}"""
-            }
-            lower.contains("ram") || lower.contains("bellek") || lower.contains("memory") -> {
-                """{"tool": "terminal", "args": {"command": "free -h 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -10"}}"""
-            }
-            lower.contains("ağ") || lower.contains("network") || lower.contains("ip") -> {
-                """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null || ifconfig 2>/dev/null"}}"""
-            }
-            lower.contains("uygulama") || lower.contains("yüklü") || lower.contains("liste") -> {
-                """{"tool": "terminal", "args": {"command": "pm list packages 2>/dev/null | head -30"}}"""
-            }
-            lower.contains("dosya") && (lower.contains("göster") || lower.contains("listele") || lower.contains("ls")) -> {
-                """{"tool": "terminal", "args": {"command": "ls -la /sdcard/ 2>/dev/null"}}"""
-            }
+        val lower = userInput.lowercase().trim()
+            .replace("[.!?,;]".toRegex(), " ")
+            .replace("\\s+".toRegex(), " ")
+            .trim()
 
-            // Şarj / pil
-            lower.contains("şarj") || lower.contains("pil") || lower.contains("batarya") || lower.contains("battery") -> {
-                """{"tool": "get_battery", "args": {}}"""
-            }
+        // ── Terminal komutları ──
 
-            // Cihaz bilgisi
-            lower.contains("sistem") || lower.contains("cihaz") || lower.contains("model") || lower.matches(Regex(".*(bilgi|info|özellik).*")) -> {
-                """{"tool": "device_info", "args": {}}"""
+        if (lower.contains("ping") && !lower.contains("pingle") && !lower.contains("ping at")) {
+            val target = when {
+                "8.8.8.8" in lower -> "8.8.8.8"
+                "google" in lower -> "google.com"
+                "1.1.1.1" in lower -> "1.1.1.1"
+                else -> "1.1.1.1"
             }
-
-            // Wi-Fi / internet
-            lower.contains("internet") || lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("bağlantı") -> {
-                """{"tool": "get_wifi_status", "args": {}}"""
-            }
-
-            // Not alma
-            lower.contains("not et") || lower.contains("hatırla") || lower.contains("kaydet") || lower.contains("not al") -> {
-                """{"tool": "write_note", "args": {"text": "$userInput"}}"""
-            }
-
-            // Notları oku
-            lower.contains("notlar") || lower.contains("hafıza") || lower.contains("notlarım") -> {
-                """{"tool": "read_notes", "args": {}}"""
-            }
-
-            // Kamera
-            lower.contains("kamera") || lower.contains("fotoğraf") || lower.contains("çek") -> {
-                """{"tool": "open_camera", "args": {}}"""
-            }
-
-            // Flaş
-            lower.contains("flaş") || lower.contains("fener") || lower.contains("ışık") || lower.contains("flash") -> {
-                val state = if (lower.contains("kapat") || lower.contains("söndür")) "off" else "on"
-                """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
-            }
-
-            // Uygulama açma
-            lower.contains("aç") && !lower.contains("flaş") && !lower.contains("fener") && !lower.contains("kamera") && !lower.contains("ışık") -> {
-                val words = lower.split(" ")
-                val appNameIndex = words.indexOf("aç") - 1
-                val appName = if (appNameIndex >= 0) words[appNameIndex] else "Bilinmeyen"
-                """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
-            }
-
-            // Varsayılan
-            else -> "Merhaba! Ben Dorina. Yerel AI Ajanınız hizmetinizde. Nasıl yardımcı olabilirim?"
+            return """{"tool": "terminal", "args": {"command": "ping -c 4 $target"}}"""
         }
+
+        // Hava durumu
+        val havaKelime = setOf("hava", "weather", "sıcaklık", "derece", "yağmur", "kar", "rüzgar", "bulut")
+        if (havaKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "curl -s 'wttr.in/Istanbul?format=%C+%t+%w&m' 2>/dev/null"}}"""
+        }
+
+        // Tarih / saat
+        val zamanKelime = setOf("tarih", "saat", "zaman", "gün", "ay", "yıl", "date", "time", "bugün günlerden")
+        if (zamanKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "date '+%A, %d %B %Y - %H:%M:%S' 2>/dev/null || date"}}"""
+        }
+
+        // Depolama / disk
+        val depolamaKelime = setOf("depolama", "hafıza", "disk", "sd kart", "boş alan", "kullanılan alan",
+            "storage", "memory", "space", "gb")
+        if (depolamaKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "df -h /sdcard /data 2>/dev/null; echo '---'; free -h 2>/dev/null"}}"""
+        }
+
+        // İşlemci / CPU
+        if (lower.contains("cpu") || lower.contains("işlemci") || lower.contains("processor") || lower.contains("çekirdek")) {
+            return """{"tool": "terminal", "args": {"command": "cat /proc/cpuinfo 2>/dev/null | grep -E 'processor|model name|Hardware' | head -10"}}"""
+        }
+
+        // RAM / bellek
+        if (lower.contains("ram") || lower.contains("bellek") || lower.contains("memory")) {
+            return """{"tool": "device_info", "args": {}}"""
+        }
+
+        // Ağ / IP
+        val agKelime = setOf("ağ", "network", "ip", "mac adres", "ağ ayarları", "bağlantı durumu")
+        if (agKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "ip addr show 2>/dev/null | grep -E 'inet|link' || ifconfig 2>/dev/null"}}"""
+        }
+
+        // Uygulama listesi
+        val uygulamaKelime = setOf("uygulama listele", "yüklü uygulama", "paket listele", "hangi uygulama")
+        if (uygulamaKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "pm list packages 2>/dev/null | awk -F: '{print \$2}' | sort | head -40"}}"""
+        }
+
+        // Dosya listele
+        val dosyaKelime = setOf("dosya listele", "klasör", "dizin", "ls", "göster", "neler var")
+        if (dosyaKelime.any { it in lower }) {
+            val path = if ("indir" in lower || "download" in lower) "/sdcard/Download" else "/sdcard"
+            return """{"tool": "terminal", "args": {"command": "ls -la '$path' 2>/dev/null | head -30"}}"""
+        }
+
+        // Kimler bağlı / login
+        val kimlerKelime = setOf("kimler", "kim bağlı", "kim online", "oturum", "who")
+        if (kimlerKelime.any { it in lower }) {
+            return """{"tool": "terminal", "args": {"command": "who 2>/dev/null; echo '---'; ps -A 2>/dev/null | head -10"}}"""
+        }
+
+        // Sistem çalışma süresi
+        if (lower.contains("uptime") || lower.contains("çalışma süresi") || lower.contains("ne zamandır açık") || lower.contains("açık kalma")) {
+            return """{"tool": "terminal", "args": {"command": "uptime; cat /proc/uptime 2>/dev/null | awk '{print \$1/86400 \" gün\"}'"}}"""
+        }
+
+        // ── Özel araçlar ──
+
+        // Pil / şarj (Genişletilmiş)
+        val pilKelime = setOf("şarj", "pil", "batarya", "battery", "yüzde", "%", "charge", "power", "enerji", "dolum")
+        if (pilKelime.any { it in lower }) {
+            return """{"tool": "get_battery", "args": {}}"""
+        }
+
+        // Cihaz bilgisi
+        val cihazKelime = setOf("cihaz", "model", "telefon", "sistem", "özellik", "bilgi", "info", "spec",
+            "donanım", "hardware", "telefonun özellik", "android")
+        if (cihazKelime.any { it in lower }) {
+            return """{"tool": "device_info", "args": {}}"""
+        }
+
+        // Wi-Fi / internet
+        val wifiKelime = setOf("wifi", "wi-fi", "internet", "bağlantı", "ağ durumu", "network", "modem")
+        if (wifiKelime.any { it in lower }) {
+            return """{"tool": "get_wifi_status", "args": {}}"""
+        }
+
+        // Not al
+        val notAlKelime = setOf("not et", "hatırla", "kaydet", "not al", "not tut", "aklımda kalsın",
+            "unutma", "yaz", "not defteri")
+        if (notAlKelime.any { it in lower }) {
+            return """{"tool": "write_note", "args": {"text": "$userInput"}}"""
+        }
+
+        // Notları oku
+        val notOkuKelime = setOf("notlar", "notlarım", "notlarımı göster", "notlarımı oku", "hafıza", "listele")
+        if (notOkuKelime.any { it in lower }) {
+            return """{"tool": "read_notes", "args": {}}"""
+        }
+
+        // Kamera
+        val kameraKelime = setOf("kamera", "fotoğraf", "çek", "selfie", "foto", "resim", "fotoğraf çek")
+        if (kameraKelime.any { it in lower }) {
+            return """{"tool": "open_camera", "args": {}}"""
+        }
+
+        // Flaş / fener
+        val flasKelime = setOf("flaş", "fener", "ışık", "flash", "torch", "lamba", "el feneri")
+        if (flasKelime.any { it in lower }) {
+            val state = if (lower.contains("kapat") || lower.contains("söndür") || lower.contains("off")) "off" else "on"
+            return """{"tool": "toggle_flash", "args": {"state": "$state"}}"""
+        }
+
+        // ── Uygulama Açma (gelişmiş) ──
+        // "x'i aç", "x i aç", "x aç", "x başlat", "x çalıştır", "x e gir"
+        val acmaRegex = Regex("""(.{2,30})['’]?(i|ı|yi|yı|e|a|ye|ya|ü|u|yu|yü)?\s*(aç|başlat|çalıştır|gir|start|launch|open)\b""", RegexOption.IGNORE_CASE)
+        val match = acmaRegex.find(lower)
+        if (match != null) {
+            var appName = match.groupValues[1].trim()
+            // Temizlik
+            appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (appName.length >= 2 && appName.length <= 30) {
+                return """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
+            }
+        }
+        // Alternatif: "aç" kelimesi içeren cümleler
+        val acik = lower.contains("aç") || lower.contains("başlat") || lower.contains("çalıştır") || lower.contains("gir")
+        if (acik) {
+            val words = lower.split(" ")
+            val acIndex = words.indexOfFirst { it in listOf("aç", "açar", "açılsın", "açıver", "açsana", "başlat", "başlatır", "çalıştır", "gir", "girelim") }
+            if (acIndex >= 1) {
+                var appName = words.subList(0, acIndex).joinToString(" ")
+                appName = appName.replace(Regex("""['’]?(i|ı|yi|yı|e|a|ye|ya|u|ü|yu|yü)$""", RegexOption.IGNORE_CASE), "")
+                    .trim()
+                if (appName.length >= 2 && appName.length <= 30) {
+                    return """{"tool": "open_app", "args": {"app_name": "$appName"}}"""
+                }
+            }
+        }
+
+        // ── Tanımlanamadı ──
+        return ""
     }
 }
 
